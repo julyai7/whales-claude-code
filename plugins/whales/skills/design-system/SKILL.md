@@ -24,7 +24,7 @@ design system that never merges with the first.
 - **If they have design systems already**: name them and ask which this
   is, or whether it's a new product. Never guess by fuzzy-matching what
   they said against the list — "the jobs one" is not a confirmation that
-  they mean "Green Jobs Board". Offer, let them pick.
+  they mean "Careers Portal". Offer, let them pick.
 - **If the list is empty**: this is a new product. Confirm the exact name
   you'll register it under before proceeding, in one sentence. You're
   naming something permanent; a two-second check beats a rename that
