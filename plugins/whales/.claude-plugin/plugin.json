@@ -1,0 +1,28 @@
+{
+  "name": "whales",
+  "displayName": "Whales",
+  "description": "Your Whales design profile, available to Claude Code. Loads your established conventions before generating UI, extracts design systems from Figma files and live URLs, and records what you accept and reject so the profile calibrates from real work instead of staying a one-shot document.",
+  "version": "0.1.0",
+  "author": {
+    "name": "July AI",
+    "url": "https://gojuly.ai"
+  },
+  "homepage": "https://gojuly.ai",
+  "repository": "https://github.com/julyai7/whales-claude-code",
+  "license": "UNLICENSED",
+  "keywords": [
+    "design",
+    "design-system",
+    "figma",
+    "design-tokens",
+    "mcp"
+  ],
+  "userConfig": {
+    "whales_token": {
+      "type": "string",
+      "title": "Whales agent token",
+      "description": "From your Whales settings page. The installer sets this for you.",
+      "sensitive": true
+    }
+  }
+}
