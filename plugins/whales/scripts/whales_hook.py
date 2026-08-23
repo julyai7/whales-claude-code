@@ -44,7 +44,7 @@ TOKEN_FILE = os.path.join(CONFIG_DIR, "token")
 GATEWAY_FILE = os.path.join(CONFIG_DIR, "gateway")
 OFFSET_DIR = os.path.join(CONFIG_DIR, "offsets")
 
-DEFAULT_GATEWAY = "https://whales-mcp-gateway-staging-2a5f90a8c6d7.herokuapp.com"
+DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 
 # Host session ids and the MCP transport's own session id are different
 # identifier spaces. Namespacing keeps two unrelated sessions from colliding

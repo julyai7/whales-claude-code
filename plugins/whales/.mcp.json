@@ -2,7 +2,7 @@
   "mcpServers": {
     "whales": {
       "type": "http",
-      "url": "https://whales-mcp-gateway-staging-2a5f90a8c6d7.herokuapp.com/mcp",
+      "url": "https://mcp.gojuly.ai/mcp",
       "headers": {
         "Authorization": "Bearer ${user_config.whales_token}"
       }
