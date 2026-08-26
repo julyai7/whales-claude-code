@@ -1,6 +1,8 @@
 {
   "permissions": {
     "allow": [
+      "mcp__whales__whales",
+      "mcp__whales__ask_whales",
       "mcp__whales__get_design_profile",
       "mcp__whales__search_design_history",
       "mcp__whales__list_design_systems",
