@@ -40,9 +40,10 @@ GATEWAY_FILE = os.path.join(CONFIG_DIR, "gateway")
 DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 TIMEOUT_SECONDS = 60
 
-# Sniffed from the bytes, not trusted from the extension: Claude Code saves a
-# pasted image as `.png` whatever it really is, and a dragged file can be
-# misnamed. The backend refuses a mismatch anyway; this just sends it right.
+# Sniffed from the bytes, not trusted from the extension: a dragged file can be
+# misnamed (a JPEG saved as `.png`), and the critique's vision pass fails on an
+# image whose stated type doesn't match its bytes. The backend detects the real
+# format too (whales_test #392); this sends an honest Content-Type regardless.
 _SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
