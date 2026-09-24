@@ -21,7 +21,18 @@ rather than an argv or an env var — ``${user_config.*}`` only interpolates
 into a hook's exec-form ``args``, which would put the token in ``ps`` output,
 and an env var would mean asking the designer to edit a shell profile, which
 is the friction the one-command install exists to remove. The same file also
-serves the Cursor hooks, which have no plugin config to read from.
+serves the Cursor hooks: the installer copies this script to a stable path
+(outside the Claude Code plugin cache, which is version-pinned and would
+break a hardcoded reference on every plugin update) and Cursor's own
+hooks.json invokes it directly with ``--source cursor_hook``.
+
+Cursor also auto-discovers and runs Claude Code plugins' hooks.json on its
+own — undocumented, and it forwards only ``command``, never the exec-form
+``args``, so an auto-discovered firing never carries ``--event``. Rather than
+special-case that, ``--event`` is optional and a firing without it silently
+no-ops: real capture only ever happens through the ``--event``-carrying
+invocation that Cursor's own hooks.json (or Claude Code's plugin hooks.json)
+supplies.
 
 Why hooks exist at all: an MCP server can only see its own tool calls. A
 design the agent writes straight to disk with the native Write tool is
@@ -48,9 +59,11 @@ DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 
 # Host session ids and the MCP transport's own session id are different
 # identifier spaces. Namespacing keeps two unrelated sessions from colliding
-# on a shared id; the SessionStart binding (see _session_start_context) is
-# what lets the backend join the two buckets back together.
-SESSION_PREFIX = "cc"
+# on a shared id — including sessions from two different HOSTS, which is why
+# this is keyed by --source rather than a single constant — and the
+# SessionStart binding (see _session_start_context) is what lets the backend
+# join the id-and-transport buckets back together within one host.
+SESSION_PREFIX = {"claude_code_hook": "cc", "cursor_hook": "cur"}
 
 # Keys that may carry a whole file. Kept but truncated: the point of capturing
 # an edit is knowing which values changed, and a multi-megabyte file would
@@ -242,7 +255,7 @@ def _send(url: str, token: str, body: bytes) -> None:
         pass
 
 
-def _session_start_context(session_id: str, capturing: bool) -> str:
+def _session_start_context(session_id: str, capturing: bool, prefix: str) -> str:
     """What SessionStart injects into the model's context.
 
     This is the fix for the one gap an MCP server structurally cannot close on
@@ -266,7 +279,7 @@ def _session_start_context(session_id: str, capturing: bool) -> str:
         "recorded."
     )
     return (
-        f"{lead} Its Claude Code session id is `{SESSION_PREFIX}:{session_id}`. "
+        f"{lead} Its Claude Code session id is `{prefix}:{session_id}`. "
         f"Pass that exact string as the `client_session_id` argument on every "
         f"Whales MCP tool call you make in this session, so tool calls and file "
         f"edits are recorded as one piece of work rather than two unrelated ones."
@@ -275,11 +288,23 @@ def _session_start_context(session_id: str, capturing: bool) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--event", required=True)
+    # Not required: Cursor auto-discovers and runs Claude Code plugins'
+    # hooks.json on its own, forwarding only `command` and never the exec-form
+    # `args` that would carry --event. A firing with no --event is that
+    # auto-discovered path, not a real one — see the module docstring — so it
+    # no-ops below rather than erroring, which is what argparse's own
+    # required=True would otherwise do (sys.exit(2), which Cursor treats as a
+    # blocked turn — the bug this fixes).
+    parser.add_argument("--event", default=None)
     parser.add_argument(
         "--source", default="claude_code_hook", choices=["claude_code_hook", "cursor_hook"]
     )
     args = parser.parse_args()
+
+    if not args.event:
+        return 0
+
+    prefix = SESSION_PREFIX[args.source]
 
     try:
         raw_stdin = sys.stdin.read()
@@ -295,14 +320,19 @@ def main() -> int:
     # Emitted before any network consideration: the session binding must work
     # even when capture is off or the designer has no token yet, because tool
     # calls authenticate off the plugin's own credential, not this file.
-    if args.event == "SessionStart" and session_id:
+    #
+    # Claude-Code-only: this is Claude Code's own hookSpecificOutput shape for
+    # injecting additionalContext. Cursor's sessionStart event has no
+    # documented equivalent output field, so emitting it there would be at
+    # best ignored — skip it rather than guess at an undocumented contract.
+    if args.event == "SessionStart" and session_id and args.source == "claude_code_hook":
         print(
             json.dumps(
                 {
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
                         "additionalContext": _session_start_context(
-                            session_id, capturing=bool(token)
+                            session_id, capturing=bool(token), prefix=prefix
                         ),
                     }
                 }
@@ -314,7 +344,7 @@ def main() -> int:
 
     payload = {
         "source": args.source,
-        "session_id": f"{SESSION_PREFIX}:{session_id}" if session_id else None,
+        "session_id": f"{prefix}:{session_id}" if session_id else None,
         "raw_payload": truncate(event),
     }
 
@@ -341,7 +371,12 @@ def main() -> int:
 if __name__ == "__main__":
     # Always 0 — see the module docstring on why a capture hook must never
     # signal failure back into the designer's editor.
+    #
+    # BaseException, not Exception: argparse rejects bad arguments by raising
+    # SystemExit(2), which Exception does not catch — and Cursor reads exit 2
+    # from beforeSubmitPrompt as "block this prompt".
     try:
-        sys.exit(main())
-    except Exception:
-        sys.exit(0)
+        code = main()
+    except BaseException:
+        code = 0
+    sys.exit(code or 0)

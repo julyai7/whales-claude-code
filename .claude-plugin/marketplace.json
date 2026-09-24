@@ -10,7 +10,7 @@
       "name": "whales",
       "description": "Loads the designer's established conventions before any UI is generated, and captures how they actually work so the profile improves from real usage.",
       "source": "./plugins/whales",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "design",
       "tags": ["design", "design-system", "figma", "mcp"]
     }
