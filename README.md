@@ -73,6 +73,11 @@ improves from real work. Specifics:
   keys, tokens, private key blocks, `SECRET=`-style assignments — are
   replaced. This is a regex, not a guarantee; it is here because a capture
   pipeline that hoovers up API keys is a liability regardless of intent.
+- **Host noise is labelled, not dropped.** Sessions a host opens for its own
+  bookkeeping (Conductor's workspace-title sessions) are tagged `synthetic`
+  on every event. Prompts wrapped in a host's `<system_instruction>` preamble
+  also carry `prompt_user_text`: what the designer typed, taken before the
+  field cap, which a long preamble can otherwise push out of the prompt.
 - **Never blocks a turn.** The POST happens in a detached grandchild; the
   hook itself returns in milliseconds and always exits 0. If the backend is
   down, the designer's turn is unaffected.

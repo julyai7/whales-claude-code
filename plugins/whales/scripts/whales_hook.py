@@ -83,6 +83,24 @@ SESSION_ID_TOOLS = frozenset({
 # Worth telling apart: only the first needs the designer to do something.
 _AUTH_STATUSES = (401, 403)
 
+# Sessions a host opens for its own bookkeeping, not the designer's work.
+# Conductor starts a separate session per workspace to name it: one prompt,
+# a one-line reply, no transcript. Captured unmarked, they read as designer
+# prompts and their reply as a model answer — ten of them in one designer's
+# two weeks. Tagged rather than dropped: the raw store keeps everything, and
+# the backend decides what to exclude.
+_SYNTHETIC_PROMPTS = (
+    ("conductor_title", re.compile(r"^\s*You are generating a short conversation title\.")),
+)
+SYNTHETIC_DIR = os.path.join(CONFIG_DIR, "synthetic")
+
+# Host-injected preambles wrapped around what the designer typed. Conductor
+# puts a long <system_instruction> block in front of every prompt, and
+# attachments get one too; a classifier reading the raw prompt reads the
+# preamble, and the 20,000-character cap can cut off the designer's words
+# entirely.
+_HOST_PREAMBLE = re.compile(r"<system_instruction>[\s\S]*?</system_instruction>")
+
 # Host session ids and the MCP transport's own session id are different
 # identifier spaces. Namespacing keeps two unrelated sessions from colliding
 # on a shared id — including sessions from two different HOSTS, which is why
@@ -219,6 +237,52 @@ def transcript_delta(transcript_path: str, session_id: str):
         return chunk.decode("utf-8", errors="replace"), start + len(chunk), more_pending, start
     except OSError:
         return "", None, False, None
+
+
+def _synthetic_marker(session_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "unknown")
+    return os.path.join(SYNTHETIC_DIR, safe)
+
+
+def synthetic_kind(event: dict, session_id: str, event_name: str) -> str:
+    """The kind of host bookkeeping session this event belongs to, or "".
+
+    Recognised from the session's prompt, then remembered in a marker file so
+    the session's later events (its Stop, whose reply is the title, and its
+    SessionEnd) carry the same tag. The marker is removed at SessionEnd. The
+    SessionStart that opens such a session is sent before any prompt exists,
+    so it cannot be tagged here; the backend joins it by session id.
+    """
+    if not session_id:
+        return ""
+    marker = _synthetic_marker(session_id)
+    kind = _read(marker)
+    if not kind and event_name == "UserPromptSubmit":
+        prompt = event.get("prompt") or ""
+        for name, pattern in _SYNTHETIC_PROMPTS:
+            if isinstance(prompt, str) and pattern.search(prompt):
+                kind = name
+                try:
+                    os.makedirs(SYNTHETIC_DIR, exist_ok=True)
+                    with open(marker, "w", encoding="utf-8") as fh:
+                        fh.write(kind)
+                except OSError:
+                    pass
+                break
+    if kind and event_name == "SessionEnd":
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+    return kind
+
+
+def prompt_user_text(prompt) -> str:
+    """The prompt with host-injected preamble blocks removed, or "" when there
+    were none. Taken from the untruncated prompt, before the field cap."""
+    if not isinstance(prompt, str) or "<system_instruction>" not in prompt:
+        return ""
+    return _HOST_PREAMBLE.sub("", prompt).strip()[:_MAX_FIELD_CHARS]
 
 
 def _attach_transcript(raw_payload: dict, text: str, start, end, more_pending: bool) -> None:
@@ -669,6 +733,14 @@ def main() -> int:
         "session_id": f"{prefix}:{session_id}" if session_id else None,
         "raw_payload": truncate(event),
     }
+    # Both read the event before truncate() capped it: a long host preamble
+    # can push the designer's own words past the cap.
+    user_text = prompt_user_text(event.get("prompt"))
+    if user_text:
+        payload["raw_payload"]["prompt_user_text"] = user_text
+    kind = synthetic_kind(event, session_id, args.event)
+    if kind:
+        payload["raw_payload"]["synthetic"] = kind
 
     # While the token is known to be rejected, send the event without the
     # transcript. Retrying is what keeps transcript from being lost, but

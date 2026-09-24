@@ -368,6 +368,64 @@ class TestProcessBehaviour:
         assert health["first_failed_at"] == "2026-09-24T09:00:00Z"
 
 
+class TestHostNoise:
+    """Conductor's own bookkeeping must not read as the designer's work."""
+
+    TITLE_PROMPT = ("You are generating a short conversation title.  Return only the title. "
+                    "Do not include backticks, explanations, quotes, markdown, or `git branch -m`.")
+
+    def test_a_conductor_title_session_is_tagged_on_every_event(self, whales_home, monkeypatch):
+        monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(whales_home / "synthetic"))
+        assert wh.synthetic_kind({"prompt": self.TITLE_PROMPT}, "side", "UserPromptSubmit") == "conductor_title"
+        # Its Stop carries the "reply" (the title) and has no prompt of its own.
+        assert wh.synthetic_kind({"last_assistant_message": "whales-design-conventions"},
+                                 "side", "Stop") == "conductor_title"
+        assert wh.synthetic_kind({}, "side", "SessionEnd") == "conductor_title"
+        assert not (whales_home / "synthetic" / "side").exists(), "marker is cleared at SessionEnd"
+
+    def test_the_designers_own_session_is_not_tagged(self, whales_home, monkeypatch):
+        monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(whales_home / "synthetic"))
+        wh.synthetic_kind({"prompt": self.TITLE_PROMPT}, "side", "UserPromptSubmit")
+        assert wh.synthetic_kind({"prompt": "make the text 20% smaller"}, "work", "UserPromptSubmit") == ""
+        assert wh.synthetic_kind({"last_assistant_message": "Done."}, "work", "Stop") == ""
+
+    def test_a_title_prompt_quoted_later_in_a_real_session_does_not_tag_it(self, whales_home, monkeypatch):
+        monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(whales_home / "synthetic"))
+        prompt = f"why does conductor send this: {self.TITLE_PROMPT}"
+        assert wh.synthetic_kind({"prompt": prompt}, "work", "UserPromptSubmit") == ""
+
+    def test_prompt_user_text_drops_the_preamble_and_keeps_what_was_typed(self):
+        prompt = ("<system_instruction>\nYou are working inside Conductor, a Mac app…\n"
+                  "</system_instruction>\n\nmake the text 20% smaller")
+        assert wh.prompt_user_text(prompt) == "make the text 20% smaller"
+
+    def test_prompt_user_text_survives_a_preamble_longer_than_the_field_cap(self):
+        prompt = f"<system_instruction>{'x' * (wh._MAX_FIELD_CHARS + 5000)}</system_instruction>" \
+                 "make the letters bigger"
+        assert "make the letters bigger" not in wh.truncate({"prompt": prompt})["prompt"], \
+            "precondition: the cap does cut the designer's words off the raw prompt"
+        assert wh.prompt_user_text(prompt) == "make the letters bigger"
+
+    def test_prompts_without_a_preamble_add_nothing(self):
+        assert wh.prompt_user_text("make it 26") == ""
+        assert wh.prompt_user_text(None) == ""
+
+    def test_both_land_on_the_shipped_event(self, tmp_path):
+        server, received = _serve(200)
+        (tmp_path / ".whales").mkdir()
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        subprocess.run(
+            [sys.executable, str(HOOK), "--event", "UserPromptSubmit"],
+            input=json.dumps({"session_id": "side", "prompt": self.TITLE_PROMPT}),
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20,
+        )
+        _wait_for(received)
+        raw = received["body"]["raw_payload"]
+        assert raw["synthetic"] == "conductor_title"
+        assert raw["prompt"] == self.TITLE_PROMPT, "the raw prompt is kept as it was"
+
+
 class TestBackfill:
     """Finished sessions never fire another hook, so after an outage their
     backlog only ships if someone runs --backfill."""
