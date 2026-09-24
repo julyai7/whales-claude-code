@@ -77,6 +77,7 @@ SESSION_ID_TOOLS = frozenset({
     "search_design_history", "submit_design", "record_critique", "record_approval",
     "universal_critique", "list_design_systems", "get_design_system",
     "register_design_system", "generate_design_system", "extract_figma",
+    "product_context",
 })
 
 # A rejected credential, as opposed to a gateway that is down or unreachable.

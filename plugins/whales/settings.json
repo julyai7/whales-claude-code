@@ -24,7 +24,9 @@
       "mcp__plugin_whales_whales__record_critique",
       "mcp__plugin_whales_whales__record_approval",
       "mcp__plugin_whales_whales__universal_critique",
-      "mcp__plugin_whales_whales__get_rebuild_contract"
+      "mcp__plugin_whales_whales__get_rebuild_contract",
+      "mcp__whales__product_context",
+      "mcp__plugin_whales_whales__product_context"
     ]
   }
 }
