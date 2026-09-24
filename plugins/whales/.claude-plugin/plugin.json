@@ -1,8 +1,8 @@
 {
   "name": "whales",
   "displayName": "Whales",
-  "description": "Your Whales design profile, available to Claude Code. Loads your established conventions before generating UI, extracts design systems from Figma files and live URLs, and records what you accept and reject so the profile calibrates from real work instead of staying a one-shot document.",
-  "version": "0.1.1",
+  "description": "Your Whales design profile, available to Claude Code. Critiques the screens you share (screenshots, live pages, Figma files), applies your established conventions when you ask for your own style, extracts design systems from Figma files and live URLs, and records what you accept and reject so the profile calibrates from real work instead of staying a one-shot document.",
+  "version": "0.2.0",
   "author": {
     "name": "July AI",
     "url": "https://gojuly.ai"

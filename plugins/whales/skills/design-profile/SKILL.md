@@ -1,6 +1,6 @@
 ---
 name: design-profile
-description: Apply the designer's own established design conventions — their colours, type, spacing, radii — when generating or revising any UI, and record what they accept or reject. Use whenever building, restyling, or reviewing an interface, component, page, or screen for this designer, and whenever they give feedback on one. Triggers on "build a page", "make a component", "restyle this", "does this match my design system", "use my conventions", and on any UI work in a project connected to Whales.
+description: Apply the designer's own established design conventions — their colours, type, spacing, radii — when they want UI built or checked in their own style, and record what they accept or reject. Use when the designer asks for their conventions or style, asks whether something matches their design system, or gives feedback on a design. Triggers on "use my conventions", "in my style", "restyle this in my style", "does this match my design system". Not needed for UI work in general, and not for rebuilding a screen `universal_critique` critiqued — that rebuild follows the critiqued screen.
 ---
 
 # Designing with this designer's own conventions
@@ -10,9 +10,12 @@ past work — Figma files, live sites, and designs they have already accepted or
 rejected. The point of this skill is that you stop guessing at values they have
 already decided.
 
-## Before you write any UI
+## When they want their own conventions
 
-Call `get_design_profile`. Not after a first draft — before, because a draft
+This is not a step for every piece of UI. Use it when the designer wants the
+work in their own style — they say so, or they ask whether something matches
+their conventions. When they do, call `get_design_profile` before you write,
+not after a first draft, because a draft
 built on invented values has to be thrown away rather than nudged, and because
 "I'll check it against the profile afterwards" reliably becomes a restyle pass
 that loses whatever was good about the draft.
@@ -42,7 +45,9 @@ exactly like a real memory.
 
 ## After you produce or revise a design
 
-Call `submit_design` with the HTML and the product. It returns a conformance
+Call `submit_design` with the HTML and the product — except for a rebuild of a
+screen `universal_critique` critiqued, which is measured against that screen,
+not against the designer's conventions. It returns a conformance
 articulation: which of their established conventions this matches, and which
 values fall outside them.
 
@@ -69,7 +74,10 @@ complaints.
 
 ## Don't
 
-- Don't generate UI first and reconcile with the profile afterwards.
+- When the designer wants their conventions, don't generate UI first and
+  reconcile with the profile afterwards.
+- Don't apply the profile to a `universal_critique` rebuild — the critiqued
+  screen is the reference there.
 - Don't merge conventions across products, or present one product's palette as
   the designer's general taste.
 - Don't paraphrase a critique into `record_critique`.
