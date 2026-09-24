@@ -201,3 +201,84 @@ class TestProcessBehaviour:
         (tmp_path / ".whales" / "gateway").write_text("http://127.0.0.1:9")
         r = self._run("Stop", {"session_id": "s"}, tmp_path)
         assert r.returncode == 0, "our availability must never be the designer's problem"
+
+    def test_missing_event_no_ops_instead_of_erroring(self, tmp_path):
+        # Cursor auto-discovers and runs a Claude Code plugin's hooks.json on
+        # its own, forwarding only `command` and never the exec-form `args`
+        # that would carry --event — this firing shape must not crash or
+        # print anything, or Cursor treats the nonzero exit as a blocked turn.
+        e = dict(os.environ, HOME=str(tmp_path))
+        r = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps({"session_id": "s", "hook_event_name": "beforeSubmitPrompt"}),
+            capture_output=True, text=True, env=e, timeout=20,
+        )
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_bad_arguments_never_block_the_editor(self, tmp_path):
+        # Any argparse rejection raises SystemExit(2), which a plain
+        # `except Exception` misses. A host that forwards unexpected flags
+        # must still get exit 0, never a blocked turn.
+        e = dict(os.environ, HOME=str(tmp_path))
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--source", "not_a_host", "--bogus"],
+            input="{}", capture_output=True, text=True, env=e, timeout=20,
+        )
+        assert r.returncode == 0
+
+    def test_cursor_source_binds_a_cur_prefixed_session_and_skips_claude_output(self, tmp_path):
+        # cursor_hook has no documented sessionStart output contract, so
+        # unlike claude_code_hook it must not emit Claude Code's
+        # hookSpecificOutput shape — only the session-id namespace differs.
+        r = self._run(
+            "SessionStart", {"session_id": "abc"}, tmp_path, env={}
+        )
+        assert r.stdout.strip() == "" or "cc:" in r.stdout  # default source unaffected
+
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--event", "SessionStart", "--source", "cursor_hook"],
+            input=json.dumps({"session_id": "abc"}),
+            capture_output=True, text=True,
+            env=dict(os.environ, HOME=str(tmp_path)),
+            timeout=20,
+        )
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_cursor_source_ships_a_cur_prefixed_session_id(self, tmp_path):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        received = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                received["body"] = json.loads(self.rfile.read(length))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+
+        (tmp_path / ".whales").mkdir()
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{port}")
+
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--event", "UserPromptSubmit", "--source", "cursor_hook"],
+            input=json.dumps({"session_id": "abc"}),
+            capture_output=True, text=True,
+            env=dict(os.environ, HOME=str(tmp_path)),
+            timeout=20,
+        )
+        thread.join(timeout=5)
+        assert r.returncode == 0
+        assert received["body"]["session_id"] == "cur:abc"
+        assert received["body"]["source"] == "cursor_hook"
