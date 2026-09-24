@@ -77,7 +77,7 @@ class TestTranscriptDelta:
         t = tmp_path / "t.jsonl"
         t.write_text("line one\n")
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        text, offset, truncated = wh.transcript_delta(str(t), "s1")
+        text, offset, truncated, _ = wh.transcript_delta(str(t), "s1")
         assert text == "line one\n"
         assert offset == t.stat().st_size
         assert truncated is False
@@ -86,20 +86,20 @@ class TestTranscriptDelta:
         t = tmp_path / "t.jsonl"
         t.write_text("line one\n")
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        _, offset, _ = wh.transcript_delta(str(t), "s2")
+        _, offset, _, _ = wh.transcript_delta(str(t), "s2")
         wh.save_offset("s2", offset)
 
         t.write_text("line one\nline two\n")
-        text, _, _ = wh.transcript_delta(str(t), "s2")
+        text, _, _, _ = wh.transcript_delta(str(t), "s2")
         assert text == "line two\n", "a delta that re-ships the whole file is quadratic"
 
     def test_nothing_new_returns_empty(self, tmp_path):
         t = tmp_path / "t.jsonl"
         t.write_text("line one\n")
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        _, offset, _ = wh.transcript_delta(str(t), "s3")
+        _, offset, _, _ = wh.transcript_delta(str(t), "s3")
         wh.save_offset("s3", offset)
-        text, offset2, _ = wh.transcript_delta(str(t), "s3")
+        text, offset2, _, _ = wh.transcript_delta(str(t), "s3")
         assert text == ""
         assert offset2 is None
 
@@ -109,28 +109,51 @@ class TestTranscriptDelta:
         t = tmp_path / "t.jsonl"
         t.write_text("a very long first session\n")
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        _, offset, _ = wh.transcript_delta(str(t), "s4")
+        _, offset, _, _ = wh.transcript_delta(str(t), "s4")
         wh.save_offset("s4", offset)
 
         t.write_text("short\n")
-        text, _, _ = wh.transcript_delta(str(t), "s4")
+        text, _, _, _ = wh.transcript_delta(str(t), "s4")
         assert text == "short\n"
 
-    def test_oversized_delta_keeps_the_tail_and_says_so(self, tmp_path):
+    def test_oversized_delta_ships_in_line_aligned_chunks_and_loses_nothing(self, tmp_path):
+        # This used to keep only the tail and jump the offset to the end,
+        # silently dropping the middle of every long turn.
         t = tmp_path / "t.jsonl"
-        t.write_text("x" * 10 + "TAIL_MARKER\n")
+        lines = [f'{{"n": {i}, "pad": "{"x" * 20}"}}\n' for i in range(10)]
+        t.write_text("".join(lines))
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        wh._MAX_TRANSCRIPT_BYTES, original = 12, wh._MAX_TRANSCRIPT_BYTES
+        wh._MAX_TRANSCRIPT_BYTES, original = 100, wh._MAX_TRANSCRIPT_BYTES
+        shipped = []
         try:
-            text, _, truncated = wh.transcript_delta(str(t), "s5")
+            while True:
+                text, offset, more, start = wh.transcript_delta(str(t), "s5")
+                if not text:
+                    break
+                assert text.endswith("\n"), "a JSONL record must never be split"
+                assert start == sum(len(c.encode()) for c in shipped)
+                shipped.append(text)
+                wh.save_offset("s5", offset, str(t))
+                if not more:
+                    break
         finally:
             wh._MAX_TRANSCRIPT_BYTES = original
-        assert truncated is True
-        assert "TAIL_MARKER" in text, "the recent turns are the ones the event is about"
+        assert len(shipped) > 1
+        assert "".join(shipped) == "".join(lines)
+
+    def test_offsets_count_bytes_not_characters(self, tmp_path):
+        # A text-mode read counts characters; on a non-ASCII transcript the
+        # offset then drifts and re-ships or skips bytes.
+        t = tmp_path / "t.jsonl"
+        t.write_text("héllo — ünïcode\n", encoding="utf-8")
+        wh.OFFSET_DIR = str(tmp_path / "offsets")
+        text, offset, more, start = wh.transcript_delta(str(t), "s7")
+        assert (text, start, more) == ("héllo — ünïcode\n", 0, False)
+        assert offset == t.stat().st_size
 
     def test_missing_transcript_is_not_an_error(self, tmp_path):
         wh.OFFSET_DIR = str(tmp_path / "offsets")
-        assert wh.transcript_delta(str(tmp_path / "nope.jsonl"), "s6") == ("", None, False)
+        assert wh.transcript_delta(str(tmp_path / "nope.jsonl"), "s6") == ("", None, False, None)
 
 
 class TestProcessBehaviour:
@@ -178,13 +201,57 @@ class TestProcessBehaviour:
         assert "capture is active" not in ctx
         assert "not configured" in ctx
 
-    def test_session_start_claims_capture_once_a_token_exists(self, tmp_path):
-        (tmp_path / ".whales").mkdir()
-        (tmp_path / ".whales" / "token").write_text("tok")
-        (tmp_path / ".whales" / "gateway").write_text("http://127.0.0.1:9")
-        r = self._run("SessionStart", {"session_id": "abc"}, tmp_path)
-        ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    def _configured(self, home, status=None):
+        (home / ".whales").mkdir()
+        (home / ".whales" / "token").write_text("tok")
+        (home / ".whales" / "gateway").write_text("http://127.0.0.1:9")
+        if status is not None:
+            (home / ".whales" / "capture_status.json").write_text(json.dumps(status))
+
+    def _session_start(self, home):
+        r = self._run("SessionStart", {"session_id": "abc"}, home)
+        return json.loads(r.stdout)
+
+    def test_a_token_alone_does_not_claim_capture_is_active(self, tmp_path):
+        # A token file says nothing about whether the gateway accepts it. This
+        # used to read "capture is active" — shown for four weeks to a
+        # designer whose every upload was being rejected.
+        self._configured(tmp_path)
+        out = self._session_start(tmp_path)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "capture is active" not in ctx
+        assert "no upload has been confirmed" in ctx
+        assert "systemMessage" not in out
+
+    def test_session_start_claims_capture_after_a_confirmed_upload(self, tmp_path):
+        self._configured(tmp_path, {"last_ok_at": "2026-09-24T10:00:00Z", "failed_since_ok": 0})
+        ctx = self._session_start(tmp_path)["hookSpecificOutput"]["additionalContext"]
         assert "capture is active" in ctx
+        assert "2026-09-24T10:00:00Z" in ctx, "say when it last worked, not just that it does"
+
+    def test_a_rejected_token_is_reported_to_the_model_and_the_designer(self, tmp_path):
+        self._configured(tmp_path, {
+            "last_ok_at": "2026-08-27T15:54:00Z",
+            "failed_since_ok": 412,
+            "first_failed_at": "2026-08-27T16:10:00Z",
+            "last_error": {"at": "2026-09-24T09:00:00Z", "status": 401, "reason": "Unauthorized"},
+        })
+        out = self._session_start(tmp_path)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "capture is active" not in ctx
+        assert "rejected" in ctx and "2026-08-27T16:10:00Z" in ctx and "412" in ctx
+        assert "installer" in out["systemMessage"], "the designer must see it, not only the model"
+
+    def test_an_unreachable_gateway_is_failing_but_asks_nothing_of_the_designer(self, tmp_path):
+        self._configured(tmp_path, {
+            "failed_since_ok": 3,
+            "first_failed_at": "2026-09-24T09:00:00Z",
+            "last_error": {"at": "2026-09-24T09:05:00Z", "status": None, "reason": "timed out"},
+        })
+        out = self._session_start(tmp_path)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "failing" in ctx and "timed out" in ctx
+        assert "systemMessage" not in out, "nothing for the designer to do about an outage"
 
     def test_capture_can_be_switched_off(self, tmp_path):
         (tmp_path / ".whales").mkdir()
@@ -282,3 +349,318 @@ class TestProcessBehaviour:
         assert r.returncode == 0
         assert received["body"]["session_id"] == "cur:abc"
         assert received["body"]["source"] == "cursor_hook"
+
+    def test_first_upload_after_an_outage_reports_how_many_were_lost(self, tmp_path):
+        server, received = _serve(200)
+        (tmp_path / ".whales").mkdir()
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        (tmp_path / ".whales" / "capture_status.json").write_text(json.dumps({
+            "failed_since_ok": 3,
+            "first_failed_at": "2026-09-24T09:00:00Z",
+            "last_error": {"at": "2026-09-24T09:05:00Z", "status": 401, "reason": "Unauthorized"},
+        }))
+        r = self._run("UserPromptSubmit", {"session_id": "abc", "prompt": "hi"}, tmp_path)
+        _wait_for(received)
+        assert r.returncode == 0
+        health = received["body"]["raw_payload"]["capture_health"]
+        assert health["failed_since_ok"] == 3
+        assert health["first_failed_at"] == "2026-09-24T09:00:00Z"
+
+
+class TestBackfill:
+    """Finished sessions never fire another hook, so after an outage their
+    backlog only ships if someone runs --backfill."""
+
+    def _setup(self, home, gateway_status):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        bodies = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                bodies.append(json.loads(self.rfile.read(length)))
+                self.send_response(gateway_status)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        (home / ".whales").mkdir()
+        (home / ".whales" / "token").write_text("tok")
+        (home / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        project = home / ".claude" / "projects" / "-Users-x-repo"
+        (project / "subagents").mkdir(parents=True)
+        (project / "sess1.jsonl").write_text('{"a": 1}\n{"b": 2}\n')
+        (project / "subagents" / "agent-1.jsonl").write_text('{"sub": 1}\n')
+        return server, bodies, project
+
+    def _run(self, home, *flags):
+        return subprocess.run(
+            [sys.executable, str(HOOK), "--backfill", *flags],
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(home)), timeout=20,
+        )
+
+    def test_ships_past_sessions_but_not_subagent_transcripts(self, tmp_path):
+        server, bodies, _ = self._setup(tmp_path, 200)
+        try:
+            r = self._run(tmp_path)
+        finally:
+            server.shutdown()
+        assert r.returncode == 0
+        assert [b["session_id"] for b in bodies] == ["cc:sess1"]
+        raw = bodies[0]["raw_payload"]
+        assert raw["hook_event_name"] == "Backfill"
+        assert raw["transcript_delta"] == '{"a": 1}\n{"b": 2}\n'
+        assert raw["transcript_delta_range"] == [0, len('{"a": 1}\n{"b": 2}\n')]
+        assert "done" in r.stdout
+
+    def test_resumes_from_the_offset_and_from_start_overrides_it(self, tmp_path):
+        server, bodies, project = self._setup(tmp_path, 200)
+        (tmp_path / ".whales" / "offsets").mkdir()
+        # An offset written by the old script: at the end, though nothing arrived.
+        (tmp_path / ".whales" / "offsets" / "sess1.offset").write_text(
+            str((project / "sess1.jsonl").stat().st_size))
+        try:
+            self._run(tmp_path)
+            assert bodies == [], "resuming from a stale offset ships nothing"
+            self._run(tmp_path, "--from-start")
+        finally:
+            server.shutdown()
+        assert len(bodies) == 1 and bodies[0]["raw_payload"]["transcript_delta_range"][0] == 0
+
+    def test_stops_at_a_rejected_token_and_leaves_the_offset(self, tmp_path):
+        server, bodies, _ = self._setup(tmp_path, 401)
+        try:
+            r = self._run(tmp_path)
+        finally:
+            server.shutdown()
+        assert len(bodies) == 1, "every later request would be rejected too"
+        assert "token rejected" in r.stdout
+        assert not (tmp_path / ".whales" / "offsets" / "sess1.offset").exists()
+        status = json.loads((tmp_path / ".whales" / "capture_status.json").read_text())
+        assert status["last_error"]["status"] == 401
+
+    def test_without_a_token_it_sends_nothing(self, tmp_path):
+        r = self._run(tmp_path)
+        assert r.returncode == 0
+        assert "nothing sent" in r.stdout
+
+
+def test_a_rejected_token_sends_events_without_re_sending_the_transcript(tmp_path):
+    server, received = _serve(200)
+    (tmp_path / ".whales").mkdir()
+    (tmp_path / ".whales" / "token").write_text("tok")
+    (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+    (tmp_path / ".whales" / "capture_status.json").write_text(json.dumps({
+        "failed_since_ok": 5,
+        "first_failed_at": "2026-09-24T09:00:00Z",
+        "last_error": {"at": "2026-09-24T09:05:00Z", "status": 401, "reason": "Unauthorized"},
+    }))
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("unshipped backlog\n")
+    subprocess.run(
+        [sys.executable, str(HOOK), "--event", "Stop"],
+        input=json.dumps({"session_id": "abc", "transcript_path": str(transcript)}),
+        capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20,
+    )
+    _wait_for(received)
+    assert "transcript_delta" not in received["body"]["raw_payload"]
+    assert not (tmp_path / ".whales" / "offsets" / "abc.offset").exists(), (
+        "the backlog must still be there to ship once the token works again"
+    )
+
+
+def _serve(status):
+    """A one-request local gateway that answers with ``status`` and keeps the
+    body it received."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            received["body"] = json.loads(self.rfile.read(length))
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.handle_request, daemon=True).start()
+    return server, received
+
+
+def _wait_for(received, timeout=5.0):
+    import time
+
+    deadline = time.time() + timeout
+    while "body" not in received and time.time() < deadline:
+        time.sleep(0.02)
+
+
+@pytest.fixture
+def whales_home(tmp_path, monkeypatch):
+    """Point the module's state files at a temp dir for in-process tests."""
+    monkeypatch.setattr(wh, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(wh, "STATUS_FILE", str(tmp_path / "capture_status.json"))
+    monkeypatch.setattr(wh, "OFFSET_DIR", str(tmp_path / "offsets"))
+    return tmp_path
+
+
+class TestDelivery:
+    """The offset may only move once the gateway has accepted the upload —
+    moving it first turned every failed upload into transcript that was never
+    sent again."""
+
+    def _transcript(self, home, text="line one\n"):
+        t = home / "t.jsonl"
+        t.write_text(text)
+        return t
+
+    def test_a_rejected_upload_leaves_the_offset_so_it_is_retried(self, whales_home):
+        t = self._transcript(whales_home)
+        server, _ = _serve(401)
+        wh.deliver(f"http://127.0.0.1:{server.server_address[1]}", "tok", b"{}",
+                   "s1", t.stat().st_size, str(t))
+        text = wh.transcript_delta(str(t), "s1")[0]
+        assert text == "line one\n", "a failed upload must ship the same bytes again"
+        status = wh.read_status()
+        assert status["failed_since_ok"] == 1
+        assert status["last_error"]["status"] == 401
+        assert wh.capture_state("tok") == "rejected"
+
+    def test_an_unreachable_gateway_is_recorded_as_failing_not_rejected(self, whales_home):
+        t = self._transcript(whales_home)
+        wh.deliver("http://127.0.0.1:9", "tok", b"{}", "s1", t.stat().st_size, str(t))
+        assert wh.read_status()["last_error"]["status"] is None
+        assert wh.capture_state("tok") == "failing"
+        assert wh.transcript_delta(str(t), "s1")[0] == "line one\n"
+
+    def test_an_accepted_upload_moves_the_offset_and_clears_the_failure_run(self, whales_home):
+        t = self._transcript(whales_home)
+        wh.record_send_result(False, 401, "Unauthorized")
+        server, _ = _serve(200)
+        wh.deliver(f"http://127.0.0.1:{server.server_address[1]}", "tok", b"{}",
+                   "s1", t.stat().st_size, str(t))
+        assert wh.transcript_delta(str(t), "s1")[0] == ""
+        status = wh.read_status()
+        assert status["failed_since_ok"] == 0
+        assert "first_failed_at" not in status
+        assert wh.capture_state("tok") == "active"
+
+    def test_a_failure_run_keeps_the_time_it_started(self, whales_home):
+        wh.record_send_result(False, 401, "Unauthorized")
+        first = wh.read_status()["first_failed_at"]
+        wh.record_send_result(False, 401, "Unauthorized")
+        status = wh.read_status()
+        assert status["failed_since_ok"] == 2
+        assert status["first_failed_at"] == first
+
+    def test_a_token_with_no_recorded_upload_is_unconfirmed(self, whales_home):
+        assert wh.capture_state("tok") == "unconfirmed"
+        assert wh.capture_state("") == "off"
+
+
+class TestOffsetOrdering:
+    """Uploads finish out of order; an earlier one finishing last must not
+    undo a later one's progress."""
+
+    def test_offset_never_moves_backwards_within_the_same_file(self, whales_home):
+        t = whales_home / "t.jsonl"
+        t.write_text("x" * 200)
+        wh.save_offset("s", 150, str(t))
+        wh.save_offset("s", 100, str(t))
+        assert (whales_home / "offsets" / "s.offset").read_text() == "150"
+
+    def test_a_shrunk_file_still_lets_the_offset_reset(self, whales_home):
+        t = whales_home / "t.jsonl"
+        t.write_text("x" * 200)
+        wh.save_offset("s", 200, str(t))
+        t.write_text("x" * 30)
+        wh.save_offset("s", 30, str(t))
+        assert (whales_home / "offsets" / "s.offset").read_text() == "30"
+
+
+class TestSessionIdInjection:
+    """The model passed ``client_session_id`` on 4 of 150 Whales calls; the
+    PreToolUse hook sets it instead."""
+
+    def _run(self, payload, home, source="claude_code_hook"):
+        return subprocess.run(
+            [sys.executable, str(HOOK), "--event", "PreToolUse", "--source", source],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env=dict(os.environ, HOME=str(home)), timeout=20,
+        )
+
+    def _event(self, tool, tool_input=None):
+        return {
+            "session_id": "abc",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"html": "<div/>", "product": "Koi"} if tool_input is None else tool_input,
+        }
+
+    @pytest.mark.parametrize("prefix", [
+        "mcp__whales__", "mcp__plugin_whales_whales__",
+        "mcp__9ee03eae-1c7e-4bbb-8a9e-271027f5c120__",
+    ])
+    def test_adds_the_session_id_and_keeps_every_other_argument(self, tmp_path, prefix):
+        # No token on purpose: tool calls authenticate with the plugin's own
+        # credential, so this must work even where capture is off.
+        r = self._run(self._event(f"{prefix}submit_design"), tmp_path)
+        assert r.returncode == 0
+        out = json.loads(r.stdout)["hookSpecificOutput"]
+        assert out["hookEventName"] == "PreToolUse"
+        assert out["updatedInput"] == {"html": "<div/>", "product": "Koi", "client_session_id": "cc:abc"}
+        assert "permissionDecision" not in out, "must not override the designer's permission rules"
+
+    def test_overwrites_a_wrong_session_id(self, tmp_path):
+        r = self._run(self._event("mcp__whales__ask_whales",
+                                  {"question": "q", "client_session_id": "cc:other"}), tmp_path)
+        assert json.loads(r.stdout)["hookSpecificOutput"]["updatedInput"]["client_session_id"] == "cc:abc"
+
+    @pytest.mark.parametrize("tool", [
+        "mcp__whales__get_rebuild_contract",  # declares no client_session_id
+        "Write",                              # not an MCP tool
+        "mcp__figma__get_design_context",     # someone else's tool
+    ])
+    def test_leaves_other_tools_alone(self, tmp_path, tool):
+        r = self._run(self._event(tool), tmp_path)
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_no_output_when_the_id_is_already_right(self, tmp_path):
+        r = self._run(self._event("mcp__whales__whales",
+                                  {"request": "r", "client_session_id": "cc:abc"}), tmp_path)
+        assert r.stdout.strip() == ""
+
+    def test_cursor_source_does_not_emit_claude_code_output(self, tmp_path):
+        r = self._run(self._event("mcp__whales__submit_design"), tmp_path, source="cursor_hook")
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_hooks_json_matcher_names_exactly_the_injected_tools(self):
+        # Two lists of the same tools; a gateway tool added to one and not the
+        # other either goes unlinked or starts the hook for nothing.
+        import re
+
+        hooks = json.loads((HOOK.parents[1] / "hooks" / "hooks.json").read_text())
+        matcher = hooks["hooks"]["PreToolUse"][0]["matcher"]
+        assert set(re.search(r"\((.*)\)", matcher).group(1).split("|")) == set(wh.SESSION_ID_TOOLS)
+
+    def test_ships_nothing_to_the_gateway(self, tmp_path):
+        server, received = _serve(200)
+        (tmp_path / ".whales").mkdir()
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        self._run(self._event("mcp__whales__submit_design"), tmp_path)
+        _wait_for(received, timeout=1.0)
+        assert "body" not in received, "PreToolUse rewrites arguments; it is not a capture event"

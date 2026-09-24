@@ -14,6 +14,19 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__.+__(whales|ask_whales|record_reaction|get_design_profile|search_design_history|submit_design|record_critique|record_approval|universal_critique|list_design_systems|get_design_system|register_design_system|generate_design_system|extract_figma)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
+            "args": ["--event", "PreToolUse"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

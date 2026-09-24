@@ -26,13 +26,19 @@ isn't a TTY, which is the case inside `curl | bash`.
 | **MCP server** | The Whales gateway over streamable HTTP, authenticated with `${user_config.whales_token}` |
 | **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system) |
 | **Agent** | `design-review` — conformance-checks a diff in its own context |
-| **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd |
+| **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd; PreToolUse on Whales tools adds `client_session_id` |
 | **Permissions** | Read-and-record Whales tools pre-allowed |
 
 `generate_design_system` and `register_design_system` are deliberately **not**
 in the permission allowlist. One spawns a minute-long extraction, the other
 overwrites a document the designer authored — neither should happen without
-them seeing a prompt.
+them seeing a prompt. `extract_figma` is left out too: each call spends one of
+a Figma file's few requests per month.
+
+Every rule is listed under both tool prefixes a Whales install can produce —
+`mcp__plugin_whales_whales__` (this plugin's own server) and `mcp__whales__`
+(a user-level `whales` server) — because a rule only matches the prefix it
+names.
 
 ## Why hooks and not just an MCP server
 
@@ -43,10 +49,14 @@ That gap is inherently local and cannot be closed by any transport choice.
 The hooks also fix something the MCP server cannot: the host's session id and
 the MCP transport's `mcp-session-id` are different identifier spaces, so a
 design submitted through `submit_design` and then hand-edited would land in
-two buckets that can never be joined. `SessionStart` injects the host session
-id and tells the model to pass it as `client_session_id`, which is what makes
-one session one story — and what lets outcomes be *observed* (submission then
-approval means accepted) rather than guessed at by a model after the fact.
+two buckets that can never be joined. A `PreToolUse` hook adds the host
+session id to every Whales tool call as `client_session_id`, which is what
+makes one session one story — and what lets outcomes be *observed*
+(submission then approval means accepted) rather than guessed at by a model
+after the fact. It rewrites the arguments only; it sets no permission
+decision, so the designer's own allow/ask rules still apply. `SessionStart`
+also tells the model the id, as the fallback for hosts that do not run the
+hook — on its own that reached only 4 of 150 calls.
 
 ## Capture, stated plainly
 
@@ -56,14 +66,23 @@ improves from real work. Specifics:
 
 - **Deltas, not whole files.** A byte offset per session is tracked under
   `~/.whales/offsets/`; each event ships only what was appended since the
-  last one, capped at 512KB (tail kept).
+  last one, capped at 512KB (tail kept). The offset moves only after the
+  gateway accepts the upload, so a failed upload is re-sent with the next
+  event instead of lost.
 - **Secrets are scrubbed before sending.** Common credential shapes — API
   keys, tokens, private key blocks, `SECRET=`-style assignments — are
   replaced. This is a regex, not a guarantee; it is here because a capture
   pipeline that hoovers up API keys is a liability regardless of intent.
 - **Never blocks a turn.** The POST happens in a detached grandchild; the
   hook itself returns in milliseconds and always exits 0. If the backend is
-  down, the designer notices nothing.
+  down, the designer's turn is unaffected.
+- **Never silently broken.** Each upload's outcome is recorded in
+  `~/.whales/capture_status.json`. `SessionStart` reports what it says —
+  active (with when the last upload was confirmed), failing, or not yet
+  confirmed — rather than assuming capture works because a token exists. A
+  rejected token is also shown to the designer directly. The first upload
+  after an outage carries a `capture_health` count of the events that did not
+  get through.
 - **Off switch:** `export WHALES_CAPTURE=off`. To stop entirely,
   `claude plugin uninstall whales` and delete `~/.whales/`.
 
