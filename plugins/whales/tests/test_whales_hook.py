@@ -216,6 +216,17 @@ class TestProcessBehaviour:
         assert r.returncode == 0
         assert r.stdout.strip() == ""
 
+    def test_bad_arguments_never_block_the_editor(self, tmp_path):
+        # Any argparse rejection raises SystemExit(2), which a plain
+        # `except Exception` misses. A host that forwards unexpected flags
+        # must still get exit 0, never a blocked turn.
+        e = dict(os.environ, HOME=str(tmp_path))
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--source", "not_a_host", "--bogus"],
+            input="{}", capture_output=True, text=True, env=e, timeout=20,
+        )
+        assert r.returncode == 0
+
     def test_cursor_source_binds_a_cur_prefixed_session_and_skips_claude_output(self, tmp_path):
         # cursor_hook has no documented sessionStart output contract, so
         # unlike claude_code_hook it must not emit Claude Code's

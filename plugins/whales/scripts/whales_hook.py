@@ -371,7 +371,12 @@ def main() -> int:
 if __name__ == "__main__":
     # Always 0 — see the module docstring on why a capture hook must never
     # signal failure back into the designer's editor.
+    #
+    # BaseException, not Exception: argparse rejects bad arguments by raising
+    # SystemExit(2), which Exception does not catch — and Cursor reads exit 2
+    # from beforeSubmitPrompt as "block this prompt".
     try:
-        sys.exit(main())
-    except Exception:
-        sys.exit(0)
+        code = main()
+    except BaseException:
+        code = 0
+    sys.exit(code or 0)
