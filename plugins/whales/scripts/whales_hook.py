@@ -78,7 +78,7 @@ SESSION_ID_TOOLS = frozenset({
     "search_design_history", "submit_design", "record_critique", "record_approval",
     "universal_critique", "list_design_systems", "get_design_system",
     "register_design_system", "generate_design_system", "extract_figma",
-    "product_context",
+    "product_context", "self_critique",
 })
 
 # A rejected credential, as opposed to a gateway that is down or unreachable.
@@ -704,8 +704,9 @@ def _session_start_context(session_id: str, lead: str, prefix: str) -> str:
     to every Whales call itself; asking the model to pass it stays as the
     fallback for hosts that do not run that hook.
     """
+    host = "Cursor" if prefix == "cur" else "Claude Code"
     return (
-        f"{lead} Its Claude Code session id is `{prefix}:{session_id}`. "
+        f"{lead} Its {host} session id is `{prefix}:{session_id}`. "
         f"Pass that exact string as the `client_session_id` argument on every "
         f"Whales MCP tool call you make in this session, so tool calls and file "
         f"edits are recorded as one piece of work rather than two unrelated ones."
@@ -741,6 +742,91 @@ def session_id_injection(event: dict, prefix: str):
             "updatedInput": {**tool_input, "client_session_id": wanted},
         }
     }
+
+
+def _bare_tool(tool: str) -> str:
+    """``submit_design`` from ``mcp__whales__submit_design`` (Claude Code) or
+    ``MCP:submit_design`` (Cursor)."""
+    return tool.rsplit(":", 1)[-1].rsplit("__", 1)[-1]
+
+
+def _cursor_tool_input(event: dict):
+    """Cursor's ``tool_input``, which can arrive as a JSON string."""
+    tool_input = event.get("tool_input")
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except ValueError:
+            return None
+    return tool_input if isinstance(tool_input, dict) else None
+
+
+def cursor_session_start_output(session_id: str, lead: str, prefix: str) -> dict:
+    """Cursor's sessionStart answer (https://cursor.com/docs/hooks).
+
+    ``additional_context`` reaches the model; ``env`` is passed to every later
+    hook in the session, which is what lets preToolUse find the id even when
+    a payload does not carry one. Claude Code's ``hookSpecificOutput`` shape
+    is ignored by Cursor — which is how a Cursor session used to end up with
+    no id at all.
+    """
+    return {
+        "additional_context": _session_start_context(session_id, lead, prefix),
+        "env": {"WHALES_CLIENT_SESSION_ID": f"{prefix}:{session_id}"},
+    }
+
+
+def cursor_session_id_injection(event: dict, prefix: str):
+    """Cursor's preToolUse answer that adds ``client_session_id`` to a Whales
+    call, or ``None``. The same job as ``session_id_injection``, in Cursor's
+    shape: ``updated_input`` rather than Claude Code's wrapper.
+
+    No ``permission`` field, for the same reason Claude Code's gets no
+    ``permissionDecision``: the designer's own allow/ask rules still apply.
+    """
+    tool_input = _cursor_tool_input(event)
+    if tool_input is None or _bare_tool(event.get("tool_name") or "") not in SESSION_ID_TOOLS:
+        return None
+    session_id = event.get("session_id") or event.get("conversation_id") or ""
+    wanted = (f"{prefix}:{session_id}" if session_id
+              else os.environ.get("WHALES_CLIENT_SESSION_ID", ""))
+    if not wanted or tool_input.get("client_session_id") == wanted:
+        return None
+    return {"updated_input": {**tool_input, "client_session_id": wanted}}
+
+
+_UPLOAD_HELPER = "~/.whales/scripts/critique_source.py"
+_PAGE_SUFFIXES = (".html", ".htm")
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def cursor_design_context(event: dict) -> str:
+    """What to tell the model after it wrote a file Whales could critique.
+
+    Cursor does not put a written file's path anywhere a later "critique
+    this" can find it, so the agent used to draw a stand-in page and
+    screenshot that. Naming the real file, and how to upload it as-is, is
+    what stops it. Context only: afterFileEdit already records the write.
+    """
+    tool_input = _cursor_tool_input(event) or {}
+    path = str(event.get("file_path") or tool_input.get("file_path") or tool_input.get("path") or "")
+    lower = path.lower()
+    if lower.endswith(".canvas.tsx"):
+        return (
+            f"Whales: a canvas was just written at `{path}`. A canvas has no image "
+            f"file, so it is not something Whales can critique as it stands. Do "
+            f"not draw a substitute page or screenshot to stand in for it."
+        )
+    if lower.endswith(_PAGE_SUFFIXES + _IMAGE_SUFFIXES):
+        kind = "page" if lower.endswith(_PAGE_SUFFIXES) else "image"
+        return (
+            f"Whales: this {kind} was written at `{path}`. If the designer asks "
+            f"Whales to critique it, upload that exact file — "
+            f"`python3 {_UPLOAD_HELPER} upload \"{path}\"` — and pass the "
+            f"`source_id` it prints to `universal_critique`. Never retype, "
+            f"recreate or screenshot a copy of it."
+        )
+    return ""
 
 
 def _session_transcripts(projects_dir: str, since_ts: float):
@@ -904,10 +990,19 @@ def main() -> int:
     # ships nothing, so it runs regardless of token or WHALES_CAPTURE — the
     # tool call itself authenticates with the plugin's own credential.
     if args.event == "PreToolUse":
-        if args.source == "claude_code_hook":
-            out = session_id_injection(event, prefix)
-            if out:
-                print(json.dumps(out))
+        out = (session_id_injection(event, prefix) if args.source == "claude_code_hook"
+               else cursor_session_id_injection(event, prefix))
+        if out:
+            print(json.dumps(out))
+        return 0
+
+    # Cursor's postToolUse on Write. Context only, never a capture: the same
+    # write already arrives through afterFileEdit, and posting it again here
+    # would record it twice.
+    if args.event == "DesignContext":
+        text = cursor_design_context(event) if args.source == "cursor_hook" else ""
+        if text:
+            print(json.dumps({"additional_context": text}))
         return 0
 
     capture_off = os.environ.get("WHALES_CAPTURE", "").lower() in ("0", "off", "false", "no")
@@ -919,10 +1014,12 @@ def main() -> int:
     # even when capture is off or the designer has no token yet, because tool
     # calls authenticate off the plugin's own credential, not this file.
     #
-    # Claude-Code-only: this is Claude Code's own hookSpecificOutput shape for
-    # injecting additionalContext. Cursor's sessionStart event has no
-    # documented equivalent output field, so emitting it there would be at
-    # best ignored — skip it rather than guess at an undocumented contract.
+    # Each host has its own answer shape. Claude Code reads
+    # hookSpecificOutput.additionalContext; Cursor reads additional_context
+    # and env (see cursor_session_start_output). The wrong shape is ignored.
+    if args.event == "SessionStart" and session_id and args.source == "cursor_hook":
+        print(json.dumps(cursor_session_start_output(
+            session_id, _capture_lead(state, status), prefix)))
     if args.event == "SessionStart" and session_id and args.source == "claude_code_hook":
         out = {
             "hookSpecificOutput": {
