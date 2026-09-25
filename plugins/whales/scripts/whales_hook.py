@@ -462,16 +462,41 @@ def read_chunk_failure(session_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def record_chunk_failure(session_id: str, start, status) -> None:
-    """Count consecutive failures of the chunk starting at ``start``."""
+def record_chunk_failure(session_id: str, start, status, end=None) -> None:
+    """Count consecutive failures of the chunk ``[start, end)``. The end is
+    kept so a retry re-sends exactly those bytes (see ``transcript_range``)."""
     previous = read_chunk_failure(session_id)
-    count = int(previous.get("count") or 0) + 1 if previous.get("start") == start else 1
+    same = previous.get("start") == start
+    count = int(previous.get("count") or 0) + 1 if same else 1
+    if end is None and same:
+        end = previous.get("end")
     try:
         os.makedirs(OFFSET_DIR, exist_ok=True)
         with open(_fail_path(session_id), "w", encoding="utf-8") as fh:
-            json.dump({"start": start, "count": count, "status": status, "at": time.time()}, fh)
+            json.dump({"start": start, "end": end, "count": count, "status": status,
+                       "at": time.time()}, fh)
     except OSError:
         pass
+
+
+def transcript_range(transcript_path: str, start: int, end: int) -> str:
+    """Exactly the bytes ``[start, end)``, or ``""`` if they are no longer
+    there (the file shrank or went away).
+
+    A retry re-sends the failed chunk byte for byte rather than reading to
+    the file's new end: when the first attempt did reach the gateway and only
+    its answer was lost, the identical ``transcript_delta_range`` is what lets
+    the backend recognise the repeat. Read to the new end, the range would
+    differ and the overlap would be stored twice.
+    """
+    try:
+        if os.path.getsize(transcript_path) < end:
+            return ""
+        with open(transcript_path, "rb") as fh:
+            fh.seek(start)
+            return fh.read(end - start).decode("utf-8", errors="replace")
+    except (OSError, TypeError, ValueError):
+        return ""
 
 
 def clear_chunk_failure(session_id: str) -> None:
@@ -522,7 +547,7 @@ def drain(url: str, token: str, session_id: str, transcript_path: str, source: s
         ok, status, reason = _send(url, token, body)
         record_send_result(ok, status, reason)
         if not ok:
-            record_chunk_failure(session_id, start, status)
+            record_chunk_failure(session_id, start, status, end=new_offset)
             break
         clear_chunk_failure(session_id)
         save_offset(session_id, new_offset, transcript_path)
@@ -540,9 +565,9 @@ def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
     Advancing it before knowing the upload succeeded turned every failed
     upload — a rejected token, an outage — into bytes that were never sent
     again. Advancing it after means a failure is retried on a later event,
-    at the cost of an occasional duplicate if the response is lost after the
-    gateway stored the event (the backend drops those by
-    ``transcript_delta_range``).
+    at the cost of a repeat if the response is lost after the gateway stored
+    the event. The retry re-sends exactly the failed range, flagged
+    ``transcript_resend``, and the backend drops it if it already has it.
 
     ``chunk_start`` is set when the body carries a transcript chunk: its
     failure is counted for the backoff. ``lock`` is the session's upload
@@ -557,7 +582,7 @@ def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
             if ok:
                 clear_chunk_failure(session_id)
             else:
-                record_chunk_failure(session_id, chunk_start, status)
+                record_chunk_failure(session_id, chunk_start, status, end=new_offset)
         if ok:
             save_offset(session_id, new_offset, transcript_path)
             if drain_to and new_offset is not None:
@@ -761,9 +786,10 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
     ``from_start`` ignores stored offsets. Offsets written by earlier
     versions of this script can sit at the end of transcripts that never
     reached the gateway (they moved before the upload was known to succeed),
-    so resuming from them would skip exactly the data that was lost. Chunks
-    carry ``transcript_delta_range``, and the backend drops a chunk it
-    already holds for that session and range.
+    so resuming from them would skip exactly the data that was lost. The
+    cost: parts that did arrive the first time are stored again. Backfill
+    cuts its own 512KB windows, which never line up with the ranges live
+    uploads used, so the backend has nothing to match them on.
 
     Scoped on purpose. ``since`` is required — there is no "everything ever"
     default — and only sessions started in ``cwd`` (the project it is run
@@ -967,6 +993,14 @@ def main() -> int:
             text, new_offset, more_pending, start = transcript_delta(transcript_path, session_id)
         elif decision == "wait":
             text, new_offset, more_pending, start = "", None, False, None
+        elif failure.get("start") == start and isinstance(failure.get("end"), int):
+            # A retry: the same bytes as the failed attempt, flagged, so the
+            # backend can drop them if that attempt did arrive.
+            again = transcript_range(transcript_path, start, failure["end"])
+            if again:
+                text, new_offset = again, failure["end"]
+                more_pending = new_offset < os.path.getsize(transcript_path)
+                payload["raw_payload"]["transcript_resend"] = True
         if not text:
             release_upload_lock(lock)
             lock = None
