@@ -27,18 +27,13 @@ isn't a TTY, which is the case inside `curl | bash`.
 | **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system) |
 | **Agent** | `design-review` — conformance-checks a diff in its own context |
 | **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd; PreToolUse on Whales tools adds `client_session_id` |
-| **Permissions** | Read-and-record Whales tools pre-allowed |
-
-`generate_design_system` and `register_design_system` are deliberately **not**
-in the permission allowlist. One spawns a minute-long extraction, the other
-overwrites a document the designer authored — neither should happen without
-them seeing a prompt. `extract_figma` is left out too: each call spends one of
-a Figma file's few requests per month.
-
-Every rule is listed under both tool prefixes a Whales install can produce —
-`mcp__plugin_whales_whales__` (this plugin's own server) and `mcp__whales__`
-(a user-level `whales` server) — because a rule only matches the prefix it
-names.
+**Permissions are not in the plugin.** Claude Code ignores `permissions` in a
+plugin's `settings.json`; only `agent` and `subagentStatusLine` take effect
+there (checked 2026-09-24 on 2.1.282: a plugin-allowed command still needed
+approval, while the same rule passed via `--allowedTools` did not). The Whales
+installer adds the read-and-record tools to the designer's own
+`~/.claude/settings.json` instead — see `WHALES_ALLOW_RULES` in the installer
+for the list and the reasons for what it leaves out.
 
 ## Why hooks and not just an MCP server
 
@@ -66,9 +61,19 @@ improves from real work. Specifics:
 
 - **Deltas, not whole files.** A byte offset per session is tracked under
   `~/.whales/offsets/`; each event ships only what was appended since the
-  last one, capped at 512KB (tail kept). The offset moves only after the
-  gateway accepts the upload, so a failed upload is re-sent with the next
-  event instead of lost.
+  last one, 512KB per upload, oldest first. The offset moves only after the
+  gateway accepts the upload, so a failed upload is re-sent later instead of
+  lost. One upload per session runs at a time (a lock under
+  `~/.whales/offsets/`), and it keeps going until the transcript is caught
+  up, so the end of a session is not left waiting for events that never
+  come.
+- **Failures back off.** A chunk that failed waits 30s, doubling up to 30
+  minutes, before it is sent again; the events themselves still go. A chunk
+  the gateway rejects as malformed three times is skipped, and the skip is
+  reported on the next event (`transcript_skipped`) rather than silently.
+- **Backfill is scoped.** `whales_hook.py --backfill --since YYYY-MM-DD`
+  re-sends the unshipped transcript of past sessions started in the current
+  directory; `--all-projects` widens it. There is no "everything" default.
 - **Secrets are scrubbed before sending.** Common credential shapes — API
   keys, tokens, private key blocks, `SECRET=`-style assignments — are
   replaced. This is a regex, not a guarantee; it is here because a capture

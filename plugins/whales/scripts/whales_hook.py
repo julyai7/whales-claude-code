@@ -49,6 +49,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -100,6 +101,28 @@ _MAX_FIELD_CHARS = 20_000
 # Most bytes we will ship from a transcript in one call. A long session's
 # JSONL grows without bound, and a single turn should never mail a 40MB file.
 _MAX_TRANSCRIPT_BYTES = 512_000
+
+# One transcript upload in flight per session. Without it, a burst of events
+# (several quick edits, then Stop) all read the same stored offset before the
+# first upload returns, and each ships the same bytes. A lock older than this
+# belongs to an upload that died; it is taken over.
+_LOCK_STALE_SECONDS = 180
+
+# After the event's own chunk is accepted, the same detached process keeps
+# shipping what is left, up to this many chunks (8MB). Otherwise the end of a
+# long session waits for events that never come once Stop and SessionEnd
+# have fired.
+_MAX_DRAIN_CHUNKS = 16
+
+# A chunk that failed waits before it is sent again: 30s, doubling, at most
+# 30 minutes. Only the transcript waits; the event itself is still sent.
+_RETRY_BASE_SECONDS = 30
+_RETRY_MAX_SECONDS = 1800
+
+# A chunk the gateway rejects as malformed this many times is skipped, and
+# the skip reported, rather than blocking the rest of the session forever.
+# Outages (5xx, timeouts) never skip: they only back off.
+_MAX_CHUNK_REJECTIONS = 3
 
 # Secret shapes, scrubbed before anything leaves the machine. This is not a
 # guarantee — no regex is — but a capture pipeline that vacuums up API keys is
@@ -321,25 +344,166 @@ def capture_state(token: str) -> str:
     return "active" if status.get("last_ok_at") else "unconfirmed"
 
 
+def _lock_path(session_id: str) -> str:
+    return _offset_path(session_id)[: -len(".offset")] + ".lock"
+
+
+def _fail_path(session_id: str) -> str:
+    return _offset_path(session_id)[: -len(".offset")] + ".fail"
+
+
+def acquire_upload_lock(session_id: str):
+    """The session's upload lock, or ``None`` if another upload holds it.
+
+    O_EXCL, not check-then-create: two hooks firing together must not both
+    win. A lock left by an upload that died is taken over once stale.
+    """
+    path = _lock_path(session_id)
+    try:
+        os.makedirs(OFFSET_DIR, exist_ok=True)
+    except OSError:
+        return None
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return path
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(path) < _LOCK_STALE_SECONDS:
+                    return None
+                os.remove(path)
+            except OSError:
+                continue
+        except OSError:
+            return None
+    return None
+
+
+def release_upload_lock(path) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def read_chunk_failure(session_id: str) -> dict:
+    try:
+        data = json.loads(_read(_fail_path(session_id)) or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def record_chunk_failure(session_id: str, start, status) -> None:
+    """Count consecutive failures of the chunk starting at ``start``."""
+    previous = read_chunk_failure(session_id)
+    count = int(previous.get("count") or 0) + 1 if previous.get("start") == start else 1
+    try:
+        os.makedirs(OFFSET_DIR, exist_ok=True)
+        with open(_fail_path(session_id), "w", encoding="utf-8") as fh:
+            json.dump({"start": start, "count": count, "status": status, "at": time.time()}, fh)
+    except OSError:
+        pass
+
+
+def clear_chunk_failure(session_id: str) -> None:
+    try:
+        os.remove(_fail_path(session_id))
+    except OSError:
+        pass
+
+
+def _is_permanent(status) -> bool:
+    """A client error that re-sending the same bytes will not fix."""
+    return isinstance(status, int) and 400 <= status < 500 and status not in (401, 403, 408, 429)
+
+
+def chunk_decision(failure: dict, start, now: float) -> str:
+    """``send``, ``wait`` or ``skip`` for the chunk starting at ``start``. Pure."""
+    if not failure or failure.get("start") != start:
+        return "send"
+    count = int(failure.get("count") or 0)
+    if _is_permanent(failure.get("status")) and count >= _MAX_CHUNK_REJECTIONS:
+        return "skip"
+    wait = min(_RETRY_BASE_SECONDS * 2 ** max(count - 1, 0), _RETRY_MAX_SECONDS)
+    return "wait" if now - float(failure.get("at") or 0) < wait else "send"
+
+
+def _chunk_body(source: str, session_key: str, session_id: str, transcript_path: str,
+                event_name: str, text: str, start, end, more_pending: bool) -> bytes:
+    raw = {"hook_event_name": event_name, "whales_event": event_name,
+           "session_id": session_id, "transcript_path": transcript_path}
+    _attach_transcript(raw, text, start, end, more_pending)
+    return scrub(json.dumps({"source": source, "session_id": session_key,
+                             "raw_payload": raw})).encode("utf-8")
+
+
+def drain(url: str, token: str, session_id: str, transcript_path: str, source: str,
+          session_key: str, max_chunks: int = _MAX_DRAIN_CHUNKS) -> int:
+    """Ship what is left of the transcript, one chunk at a time; returns how
+    many were accepted. Runs in the detached process that holds the session's
+    upload lock, so nothing here can be shipped twice by a concurrent hook.
+    Stops at the first failure, which is recorded for the backoff."""
+    shipped = 0
+    for _ in range(max_chunks):
+        text, new_offset, more_pending, start = transcript_delta(transcript_path, session_id)
+        if not text:
+            break
+        body = _chunk_body(source, session_key, session_id, transcript_path, "TranscriptChunk",
+                           text, start, new_offset, more_pending)
+        ok, status, reason = _send(url, token, body)
+        record_send_result(ok, status, reason)
+        if not ok:
+            record_chunk_failure(session_id, start, status)
+            break
+        clear_chunk_failure(session_id)
+        save_offset(session_id, new_offset, transcript_path)
+        shipped += 1
+        if not more_pending:
+            break
+    return shipped
+
+
 def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
-            transcript_path: str) -> None:
+            transcript_path: str, chunk_start=None, lock=None, drain_to=None) -> None:
     """Send one event, record the outcome, and only then move the offset.
 
     The offset is what says "these transcript bytes have been shipped".
     Advancing it before knowing the upload succeeded turned every failed
     upload — a rejected token, an outage — into bytes that were never sent
-    again. Advancing it after means a failure is retried on the next event,
+    again. Advancing it after means a failure is retried on a later event,
     at the cost of an occasional duplicate if the response is lost after the
-    gateway stored the event.
+    gateway stored the event (the backend drops those by
+    ``transcript_delta_range``).
+
+    ``chunk_start`` is set when the body carries a transcript chunk: its
+    failure is counted for the backoff. ``lock`` is the session's upload
+    lock, released here whatever happens. ``drain_to`` is
+    ``(source, session_key)``: with it, an accepted upload goes on to ship
+    the rest of the transcript.
     """
-    ok, status, reason = _send(url, token, body)
-    record_send_result(ok, status, reason)
-    if ok:
-        save_offset(session_id, new_offset, transcript_path)
+    try:
+        ok, status, reason = _send(url, token, body)
+        record_send_result(ok, status, reason)
+        if chunk_start is not None:
+            if ok:
+                clear_chunk_failure(session_id)
+            else:
+                record_chunk_failure(session_id, chunk_start, status)
+        if ok:
+            save_offset(session_id, new_offset, transcript_path)
+            if drain_to and new_offset is not None:
+                drain(url, token, session_id, transcript_path, *drain_to)
+    finally:
+        release_upload_lock(lock)
 
 
 def post_detached(url: str, token: str, body: bytes, session_id: str = "",
-                  new_offset=None, transcript_path: str = "") -> None:
+                  new_offset=None, transcript_path: str = "", chunk_start=None,
+                  lock=None, drain_to=None) -> None:
     """Deliver in a detached grandchild so the hook returns immediately.
 
     Double-fork so the intermediate child exits at once and the grandchild is
@@ -347,13 +511,13 @@ def post_detached(url: str, token: str, body: bytes, session_id: str = "",
     process it did not know it spawned. On any platform without fork we fall
     back to a short blocking send, which is still bounded by the timeout.
     """
-    job = (url, token, body, session_id, new_offset, transcript_path)
+    job = (url, token, body, session_id, new_offset, transcript_path, chunk_start, lock, drain_to)
     if not hasattr(os, "fork"):
         deliver(*job)
         return
     try:
         if os.fork() != 0:
-            return  # parent: done, hook exits now
+            return  # parent: done, hook exits now; the grandchild owns the lock
     except OSError:
         deliver(*job)
         return
@@ -511,7 +675,15 @@ def _session_transcripts(projects_dir: str, since_ts: float):
     return sorted(found, key=os.path.getmtime)
 
 
-def backfill(since: str, from_start: bool, projects_dir: str = "") -> int:
+def project_transcript_dir(cwd: str, projects_dir: str) -> str:
+    """Where Claude Code keeps the transcripts of sessions started in ``cwd``:
+    the path with every character that is not a letter or digit turned into
+    ``-`` (``/Users/me/Koi`` -> ``-Users-me-Koi``)."""
+    return os.path.join(projects_dir, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def backfill(since: str, from_start: bool, projects_dir: str = "",
+             all_projects: bool = False, cwd: str = "") -> int:
     """Ship the unshipped transcript of past sessions, run by hand.
 
     For recovering after capture was broken — a rejected token, an outage —
@@ -525,13 +697,23 @@ def backfill(since: str, from_start: bool, projects_dir: str = "") -> int:
     versions of this script can sit at the end of transcripts that never
     reached the gateway (they moved before the upload was known to succeed),
     so resuming from them would skip exactly the data that was lost. Chunks
-    carry ``transcript_delta_range``, so the backend can collapse anything
-    that did arrive the first time.
+    carry ``transcript_delta_range``, and the backend drops a chunk it
+    already holds for that session and range.
+
+    Scoped on purpose. ``since`` is required — there is no "everything ever"
+    default — and only sessions started in ``cwd`` (the project it is run
+    from) are sent unless ``all_projects`` is set, so a designer recovering
+    one project's capture does not also upload every unrelated session on
+    the machine, including ones from before Whales was installed.
     """
     capture_off = os.environ.get("WHALES_CAPTURE", "").lower() in ("0", "off", "false", "no")
     token = "" if capture_off else _read(TOKEN_FILE)
     if not token:
         print("Whales backfill: no token at ~/.whales/token (or WHALES_CAPTURE is off); nothing sent.")
+        return 0
+    if not since:
+        print("Whales backfill: pass --since YYYY-MM-DD (the first day capture was broken); "
+              "nothing sent.")
         return 0
     try:
         since_ts = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
@@ -541,8 +723,13 @@ def backfill(since: str, from_start: bool, projects_dir: str = "") -> int:
 
     url = gateway_url()
     projects_dir = projects_dir or os.path.expanduser("~/.claude/projects")
+    search_dir = projects_dir if all_projects else project_transcript_dir(cwd or os.getcwd(), projects_dir)
+    if not os.path.isdir(search_dir):
+        print(f"Whales backfill: no Claude Code sessions found for {cwd or os.getcwd()} "
+              f"(looked in {search_dir}). Run it from the project, or pass --all-projects.")
+        return 0
     sessions = chunks = sent_bytes = 0
-    for path in _session_transcripts(projects_dir, since_ts):
+    for path in _session_transcripts(search_dir, since_ts):
         session_id = os.path.splitext(os.path.basename(path))[0]
         if from_start:
             try:
@@ -554,7 +741,8 @@ def backfill(since: str, from_start: bool, projects_dir: str = "") -> int:
             text, new_offset, more_pending, start = transcript_delta(path, session_id)
             if not text:
                 break
-            raw = {"hook_event_name": "Backfill", "session_id": session_id, "transcript_path": path}
+            raw = {"hook_event_name": "Backfill", "whales_event": "Backfill",
+                   "session_id": session_id, "transcript_path": path}
             _attach_transcript(raw, text, start, new_offset, more_pending)
             body = scrub(json.dumps({
                 "source": "claude_code_hook",
@@ -597,14 +785,16 @@ def main() -> int:
     )
     parser.add_argument("--backfill", action="store_true",
                         help="ship the unshipped transcript of past sessions, then exit")
-    parser.add_argument("--since", default="2000-01-01",
-                        help="with --backfill: only sessions modified on or after YYYY-MM-DD")
+    parser.add_argument("--since", default="",
+                        help="with --backfill (required): only sessions modified on or after YYYY-MM-DD")
+    parser.add_argument("--all-projects", action="store_true",
+                        help="with --backfill: every project's sessions, not just this directory's")
     parser.add_argument("--from-start", action="store_true",
                         help="with --backfill: ignore stored offsets and re-ship from the beginning")
     args = parser.parse_args()
 
     if args.backfill:
-        return backfill(args.since, args.from_start)
+        return backfill(args.since, args.from_start, all_projects=args.all_projects)
 
     if not args.event:
         return 0
@@ -664,23 +854,49 @@ def main() -> int:
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
 
+    session_key = f"{prefix}:{session_id}" if session_id else None
     payload = {
         "source": args.source,
-        "session_id": f"{prefix}:{session_id}" if session_id else None,
+        "session_id": session_key,
         "raw_payload": truncate(event),
     }
+    # The canonical event name, whatever the host calls it: Cursor's own
+    # payload says beforeSubmitPrompt / afterFileEdit, and the backend passes
+    # read this to treat both hosts alike.
+    payload["raw_payload"]["whales_event"] = args.event
 
     # While the token is known to be rejected, send the event without the
     # transcript. Retrying is what keeps transcript from being lost, but
     # re-sending up to 512KB on every prompt and edit to a gateway that will
     # refuse it only costs the designer bandwidth. The offset stays put, so
     # the backlog ships once an upload is accepted again.
-    if state == "rejected":
-        text, new_offset, more_pending, start = "", None, False, None
-    else:
-        text, new_offset, more_pending, start = transcript_delta(
-            event.get("transcript_path", ""), session_id
-        )
+    #
+    # Otherwise the transcript rides along only with the session's upload
+    # lock: an upload already in flight will drain what this event would have
+    # sent, and sending it here too would ship it twice.
+    transcript_path = event.get("transcript_path", "")
+    text, new_offset, more_pending, start = "", None, False, None
+    lock = None
+    if state != "rejected" and session_id and transcript_path:
+        lock = acquire_upload_lock(session_id)
+    if lock:
+        text, new_offset, more_pending, start = transcript_delta(transcript_path, session_id)
+        failure = read_chunk_failure(session_id) if text else {}
+        decision = chunk_decision(failure, start, time.time()) if text else "send"
+        if decision == "skip":
+            # Rejected as malformed every time: move past it, and say so.
+            payload["raw_payload"]["transcript_skipped"] = {
+                "range": [start, new_offset], "http_status": failure.get("status"),
+                "attempts": failure.get("count"),
+            }
+            save_offset(session_id, new_offset, transcript_path)
+            clear_chunk_failure(session_id)
+            text, new_offset, more_pending, start = transcript_delta(transcript_path, session_id)
+        elif decision == "wait":
+            text, new_offset, more_pending, start = "", None, False, None
+        if not text:
+            release_upload_lock(lock)
+            lock = None
     if text:
         _attach_transcript(payload["raw_payload"], text, start, new_offset, more_pending)
 
@@ -697,14 +913,16 @@ def main() -> int:
     try:
         body = scrub(json.dumps(payload)).encode("utf-8")
     except (TypeError, ValueError):
+        release_upload_lock(lock)
         return 0
 
     # The offset moves inside deliver(), only once the gateway accepted the
     # upload. A failure leaves it where it was, so the same bytes ship again
-    # next event — a duplicate the backend can collapse, rather than a
-    # silent hole it can never know about.
-    post_detached(gateway_url(), token, body, session_id, new_offset,
-                  event.get("transcript_path", ""))
+    # on a later event (after the backoff) rather than leaving a silent hole
+    # the backend can never know about.
+    post_detached(gateway_url(), token, body, session_id, new_offset, transcript_path,
+                  chunk_start=start if text else None, lock=lock,
+                  drain_to=(args.source, session_key) if text else None)
     return 0
 
 
