@@ -1,7 +1,7 @@
 ---
 name: design-review
 description: Check changed UI code against this designer's established Whales conventions and report what falls outside them. Use when asked to review a design, check conformance, or verify a change matches their design system — and before handing over a batch of UI work.
-tools: Read, Grep, Glob, Bash, mcp__whales__get_design_profile, mcp__whales__search_design_history
+tools: Read, Grep, Glob, Bash, mcp__whales__get_design_profile, mcp__whales__search_design_history, mcp__plugin_whales_whales__get_design_profile, mcp__plugin_whales_whales__search_design_history
 model: sonnet
 ---
 
