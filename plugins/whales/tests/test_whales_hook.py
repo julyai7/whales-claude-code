@@ -227,10 +227,9 @@ class TestProcessBehaviour:
         )
         assert r.returncode == 0
 
-    def test_cursor_source_binds_a_cur_prefixed_session_and_skips_claude_output(self, tmp_path):
-        # cursor_hook has no documented sessionStart output contract, so
-        # unlike claude_code_hook it must not emit Claude Code's
-        # hookSpecificOutput shape — only the session-id namespace differs.
+    def test_cursor_source_binds_a_cur_prefixed_session_in_cursors_shape(self, tmp_path):
+        # Cursor reads additional_context and env, not Claude Code's
+        # hookSpecificOutput. Emitting the Claude shape here is ignored.
         r = self._run(
             "SessionStart", {"session_id": "abc"}, tmp_path, env={}
         )
@@ -244,7 +243,10 @@ class TestProcessBehaviour:
             timeout=20,
         )
         assert r.returncode == 0
-        assert r.stdout.strip() == ""
+        out = json.loads(r.stdout)
+        assert "hookSpecificOutput" not in out
+        assert out["env"]["WHALES_CLIENT_SESSION_ID"] == "cur:abc"
+        assert "cur:abc" in out["additional_context"]
 
     def test_cursor_source_ships_a_cur_prefixed_session_id(self, tmp_path):
         import threading

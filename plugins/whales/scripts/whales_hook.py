@@ -65,6 +65,16 @@ DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 # join the id-and-transport buckets back together within one host.
 SESSION_PREFIX = {"claude_code_hook": "cc", "cursor_hook": "cur"}
 
+# Whales tools that take client_session_id. Matched on the bare name because
+# Claude Code prefixes mcp__…__ and Cursor uses MCP:<name>.
+SESSION_ID_TOOLS = frozenset({
+    "whales", "ask_whales", "record_reaction", "get_design_profile",
+    "search_design_history", "submit_design", "record_critique", "record_approval",
+    "universal_critique", "list_design_systems", "get_design_system",
+    "register_design_system", "generate_design_system", "extract_figma",
+    "product_context",
+})
+
 # Keys that may carry a whole file. Kept but truncated: the point of capturing
 # an edit is knowing which values changed, and a multi-megabyte file would
 # bloat the store without adding signal.
@@ -278,12 +288,209 @@ def _session_start_context(session_id: str, capturing: bool, prefix: str) -> str
         "machine, so file edits made outside the Whales tools are not being "
         "recorded."
     )
+    host = "Cursor" if prefix == "cur" else "Claude Code"
     return (
-        f"{lead} Its Claude Code session id is `{prefix}:{session_id}`. "
+        f"{lead} Its {host} session id is `{prefix}:{session_id}`. "
         f"Pass that exact string as the `client_session_id` argument on every "
         f"Whales MCP tool call you make in this session, so tool calls and file "
         f"edits are recorded as one piece of work rather than two unrelated ones."
     )
+
+
+def _tool_input(event: dict):
+    tool_input = event.get("tool_input")
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except ValueError:
+            return None
+    return tool_input if isinstance(tool_input, dict) else None
+
+
+def _bare_tool(tool: str) -> str:
+    return tool.rsplit(":", 1)[-1].rsplit("__", 1)[-1]
+
+
+def session_id_injection(event: dict, prefix: str):
+    """The PreToolUse output that adds ``client_session_id`` to a Whales call,
+    or ``None`` when there is nothing to do.
+
+    Asking the model to pass the id did not work: the review behind this
+    change found it on 4 of 150 tool calls, so reactions could not be joined
+    to the designs they were about. Setting it here makes it deterministic.
+
+    ``updatedInput`` replaces the tool's input rather than merging into it, so
+    every original argument is echoed back. ``permissionDecision`` is left out
+    on purpose — setting it would override the designer's own allow/ask rules
+    for these tools, which is not this hook's business.
+    """
+    tool = event.get("tool_name") or ""
+    tool_input = event.get("tool_input")
+    session_id = event.get("session_id") or ""
+    if not tool.startswith("mcp__") or not session_id or not isinstance(tool_input, dict):
+        return None
+    if tool.rsplit("__", 1)[-1] not in SESSION_ID_TOOLS:
+        return None
+    wanted = f"{prefix}:{session_id}"
+    if tool_input.get("client_session_id") == wanted:
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": {**tool_input, "client_session_id": wanted},
+        }
+    }
+
+
+def cursor_session_start_output(session_id: str, capturing: bool, prefix: str) -> dict:
+    """Cursor's sessionStart output. ``additional_context`` is the documented
+    field; ``env`` is the one later hooks can read even when that context is
+    dropped. Claude Code's ``hookSpecificOutput`` shape is not this contract.
+    """
+    return {
+        "additional_context": _session_start_context(session_id, capturing, prefix),
+        "env": {"WHALES_CLIENT_SESSION_ID": f"{prefix}:{session_id}"},
+    }
+
+
+def cursor_session_id_injection(event: dict, prefix: str):
+    """Cursor preToolUse uses ``updated_input``, not Claude Code's wrapper."""
+    tool = event.get("tool_name") or ""
+    tool_input = _tool_input(event)
+    session_id = event.get("session_id") or event.get("conversation_id") or ""
+    if _bare_tool(tool) not in SESSION_ID_TOOLS or not session_id or tool_input is None:
+        return None
+    wanted = f"{prefix}:{session_id}"
+    if tool_input.get("client_session_id") == wanted:
+        return None
+    return {"updated_input": {**tool_input, "client_session_id": wanted}}
+
+
+_DESIGN_SUFFIXES = (".html", ".htm", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".canvas.tsx")
+
+
+def cursor_design_context(event: dict) -> str:
+    """A path the model can hand to Whales, from the file just written.
+
+    A canvas has no pixels. Saying so here is what stops a later "critique
+    this" from inventing a second page and screenshotting that.
+    """
+    path = event.get("file_path") or ""
+    if not path:
+        tool_input = _tool_input(event)
+        if tool_input:
+            path = tool_input.get("path") or tool_input.get("file_path") or ""
+    if not any(str(path).endswith(suffix) for suffix in _DESIGN_SUFFIXES):
+        return ""
+    if str(path).endswith(".canvas.tsx"):
+        return (
+            f"Whales: a canvas was just written at `{path}`. Cursor has not "
+            f"exported it to a PNG, so it is not a critique source. Do not draw "
+            f"a substitute page and screenshot that."
+        )
+    if str(path).endswith((".html", ".htm")):
+        return (
+            f"Whales: HTML written this session is at `{path}`. If the designer "
+            f"asks to critique it, pass that file's markup as `html`. Do not "
+            f"screenshot a recreation."
+        )
+    return (
+        f"Whales: an image written this session is at `{path}`. If the designer "
+        f"asks to critique it, upload that path. Do not redraw it."
+    )
+
+
+def _session_transcripts(projects_dir: str, since_ts: float):
+    """Top-level Claude Code session transcripts modified since ``since_ts``.
+
+    Subagent transcripts are skipped: their turns already appear in the
+    parent session's transcript, so shipping them again would double-count
+    the work.
+    """
+    found = []
+    for root, dirs, files in os.walk(projects_dir):
+        dirs[:] = [d for d in dirs if d != "subagents"]
+        for name in files:
+            if not name.endswith(".jsonl") or name.startswith("agent-"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if os.path.getmtime(path) >= since_ts:
+                    found.append(path)
+            except OSError:
+                pass
+    return sorted(found, key=os.path.getmtime)
+
+
+def backfill(since: str, from_start: bool, projects_dir: str = "") -> int:
+    """Ship the unshipped transcript of past sessions, run by hand.
+
+    For recovering after capture was broken — a rejected token, an outage —
+    when finished sessions will never fire another hook to carry their
+    backlog. Sends synchronously, chunk by chunk, and moves each offset only
+    once its chunk is accepted, so it is safe to interrupt and re-run. Stops
+    at the first failure: if the token is rejected, every later request
+    would be too.
+
+    ``from_start`` ignores stored offsets. Offsets written by earlier
+    versions of this script can sit at the end of transcripts that never
+    reached the gateway (they moved before the upload was known to succeed),
+    so resuming from them would skip exactly the data that was lost. Chunks
+    carry ``transcript_delta_range``, so the backend can collapse anything
+    that did arrive the first time.
+    """
+    capture_off = os.environ.get("WHALES_CAPTURE", "").lower() in ("0", "off", "false", "no")
+    token = "" if capture_off else _read(TOKEN_FILE)
+    if not token:
+        print("Whales backfill: no token at ~/.whales/token (or WHALES_CAPTURE is off); nothing sent.")
+        return 0
+    try:
+        since_ts = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        print(f"Whales backfill: --since must be YYYY-MM-DD, got {since!r}.")
+        return 0
+
+    url = gateway_url()
+    projects_dir = projects_dir or os.path.expanduser("~/.claude/projects")
+    sessions = chunks = sent_bytes = 0
+    for path in _session_transcripts(projects_dir, since_ts):
+        session_id = os.path.splitext(os.path.basename(path))[0]
+        if from_start:
+            try:
+                os.remove(_offset_path(session_id))
+            except OSError:
+                pass
+        shipped_any = False
+        while True:
+            text, new_offset, more_pending, start = transcript_delta(path, session_id)
+            if not text:
+                break
+            raw = {"hook_event_name": "Backfill", "session_id": session_id, "transcript_path": path}
+            _attach_transcript(raw, text, start, new_offset, more_pending)
+            body = scrub(json.dumps({
+                "source": "claude_code_hook",
+                "session_id": f"{SESSION_PREFIX['claude_code_hook']}:{session_id}",
+                "raw_payload": raw,
+            })).encode("utf-8")
+            ok, status, reason = _send(url, token, body)
+            record_send_result(ok, status, reason)
+            if not ok:
+                why = "token rejected — re-run the Whales installer" if status in _AUTH_STATUSES \
+                    else (reason or "gateway unreachable")
+                print(f"Whales backfill stopped: {why} (HTTP {status}). "
+                      f"Sent {chunks} chunk(s) from {sessions} session(s) before stopping; "
+                      f"re-run to resume.")
+                return 0
+            save_offset(session_id, new_offset, path)
+            shipped_any = True
+            chunks += 1
+            sent_bytes += len(text.encode("utf-8"))
+            if not more_pending:
+                break
+        sessions += shipped_any
+    print(f"Whales backfill done: {chunks} chunk(s), {sent_bytes // 1024} KB "
+          f"from {sessions} session(s) since {since}.")
+    return 0
 
 
 def main() -> int:
@@ -314,6 +521,24 @@ def main() -> int:
 
     session_id = event.get("session_id") or event.get("conversation_id") or ""
 
+    # Not a capture event: it rewrites a Whales tool call's arguments and
+    # ships nothing, so it runs regardless of token or WHALES_CAPTURE — the
+    # tool call itself authenticates with the plugin's own credential.
+    if args.event == "PreToolUse":
+        out = (session_id_injection(event, prefix) if args.source == "claude_code_hook"
+               else cursor_session_id_injection(event, prefix))
+        if out:
+            print(json.dumps(out))
+        return 0
+
+    # Context only. afterFileEdit already posts the write; this must not post
+    # it a second time. Cursor reads additional_context from postToolUse.
+    if args.event == "DesignContext" and args.source == "cursor_hook":
+        text = cursor_design_context(event)
+        if text:
+            print(json.dumps({"additional_context": text}))
+        return 0
+
     capture_off = os.environ.get("WHALES_CAPTURE", "").lower() in ("0", "off", "false", "no")
     token = "" if capture_off else _read(TOKEN_FILE)
 
@@ -321,10 +546,10 @@ def main() -> int:
     # even when capture is off or the designer has no token yet, because tool
     # calls authenticate off the plugin's own credential, not this file.
     #
-    # Claude-Code-only: this is Claude Code's own hookSpecificOutput shape for
-    # injecting additionalContext. Cursor's sessionStart event has no
-    # documented equivalent output field, so emitting it there would be at
-    # best ignored — skip it rather than guess at an undocumented contract.
+    # Each host has its own stdout contract. Claude Code reads
+    # hookSpecificOutput.additionalContext. Cursor reads additional_context
+    # and env (https://cursor.com/docs/hooks). Emitting the wrong shape is
+    # ignored, which is how a Cursor session ended up with no client_session_id.
     if args.event == "SessionStart" and session_id and args.source == "claude_code_hook":
         print(
             json.dumps(
@@ -338,6 +563,10 @@ def main() -> int:
                 }
             )
         )
+    elif args.event == "SessionStart" and session_id and args.source == "cursor_hook":
+        print(json.dumps(cursor_session_start_output(
+            session_id, bool(token), prefix
+        )))
 
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
