@@ -294,10 +294,9 @@ class TestProcessBehaviour:
         )
         assert r.returncode == 0
 
-    def test_cursor_source_binds_a_cur_prefixed_session_and_skips_claude_output(self, tmp_path):
-        # cursor_hook has no documented sessionStart output contract, so
-        # unlike claude_code_hook it must not emit Claude Code's
-        # hookSpecificOutput shape — only the session-id namespace differs.
+    def test_cursor_source_binds_a_cur_prefixed_session_in_cursors_shape(self, tmp_path):
+        # Cursor reads additional_context and env, not Claude Code's
+        # hookSpecificOutput. Emitting the Claude shape here is ignored.
         r = self._run(
             "SessionStart", {"session_id": "abc"}, tmp_path, env={}
         )
@@ -311,7 +310,10 @@ class TestProcessBehaviour:
             timeout=20,
         )
         assert r.returncode == 0
-        assert r.stdout.strip() == ""
+        out = json.loads(r.stdout)
+        assert "hookSpecificOutput" not in out
+        assert out["env"]["WHALES_CLIENT_SESSION_ID"] == "cur:abc"
+        assert "cur:abc" in out["additional_context"]
 
     def test_cursor_source_ships_a_cur_prefixed_session_id(self, tmp_path):
         import threading
@@ -722,10 +724,12 @@ class TestSessionIdInjection:
                                   {"request": "r", "client_session_id": "cc:abc"}), tmp_path)
         assert r.stdout.strip() == ""
 
-    def test_cursor_source_does_not_emit_claude_code_output(self, tmp_path):
-        r = self._run(self._event("mcp__whales__submit_design"), tmp_path, source="cursor_hook")
+    def test_cursor_source_answers_in_cursors_shape_not_claude_codes(self, tmp_path):
+        r = self._run(self._event("MCP:submit_design"), tmp_path, source="cursor_hook")
         assert r.returncode == 0
-        assert r.stdout.strip() == ""
+        out = json.loads(r.stdout)
+        assert "hookSpecificOutput" not in out
+        assert out["updated_input"]["client_session_id"] == "cur:abc"
 
     def test_hooks_json_matcher_names_exactly_the_injected_tools(self):
         # Two lists of the same tools; a gateway tool added to one and not the
@@ -958,3 +962,123 @@ def test_a_burst_of_events_ships_every_byte_once(tmp_path):
     assert spans[0][0] == 0 and spans[-1][1] == size
     for (_, end), (start, _) in zip(spans, spans[1:]):
         assert end == start, f"overlap or gap in {spans}"
+
+
+class TestCursorHost:
+    """Cursor's own answer shapes (https://cursor.com/docs/hooks): it ignores
+    Claude Code's hookSpecificOutput, so each of these used to do nothing."""
+
+    def _run(self, event_name, payload, home, env=None):
+        e = dict(os.environ, HOME=str(home))
+        e.pop("WHALES_CLIENT_SESSION_ID", None)
+        e.update(env or {})
+        return subprocess.run(
+            [sys.executable, str(HOOK), "--event", event_name, "--source", "cursor_hook"],
+            input=json.dumps(payload), capture_output=True, text=True, env=e, timeout=20,
+        )
+
+    # -- preToolUse ---------------------------------------------------------
+
+    @pytest.mark.parametrize("tool", ["MCP:universal_critique", "mcp__whales__universal_critique"])
+    def test_injection_keeps_every_argument_and_adds_the_session(self, tool):
+        out = wh.cursor_session_id_injection(
+            {"tool_name": tool, "conversation_id": "c1",
+             "tool_input": {"source_id": "a" * 32 + ".html", "goal": "RSVPs"}}, "cur")
+        assert out == {"updated_input": {"source_id": "a" * 32 + ".html", "goal": "RSVPs",
+                                         "client_session_id": "cur:c1"}}
+        assert "permission" not in out
+
+    def test_a_json_string_tool_input_is_parsed(self):
+        out = wh.cursor_session_id_injection(
+            {"tool_name": "MCP:self_critique", "session_id": "s",
+             "tool_input": json.dumps({"source_id": "x", "critique_id": "c"})}, "cur")
+        assert out["updated_input"] == {"source_id": "x", "critique_id": "c", "client_session_id": "cur:s"}
+
+    def test_falls_back_to_the_env_session_start_set(self, monkeypatch):
+        monkeypatch.setenv("WHALES_CLIENT_SESSION_ID", "cur:from-env")
+        out = wh.cursor_session_id_injection(
+            {"tool_name": "MCP:record_critique", "tool_input": {"critique": "too busy"}}, "cur")
+        assert out["updated_input"]["client_session_id"] == "cur:from-env"
+
+    @pytest.mark.parametrize("event", [
+        {"tool_name": "MCP:get_rebuild_contract", "session_id": "s", "tool_input": {}},
+        {"tool_name": "Write", "session_id": "s", "tool_input": {"file_path": "a.html"}},
+        {"tool_name": "MCP:submit_design", "session_id": "s", "tool_input": "not json"},
+        {"tool_name": "MCP:submit_design", "tool_input": {"html": "<p/>"}},
+        {"tool_name": "MCP:submit_design", "session_id": "s",
+         "tool_input": {"client_session_id": "cur:s"}},
+    ])
+    def test_nothing_to_do(self, event, monkeypatch):
+        monkeypatch.delenv("WHALES_CLIENT_SESSION_ID", raising=False)
+        assert wh.cursor_session_id_injection(event, "cur") is None
+
+    # -- sessionStart --------------------------------------------------------
+
+    def test_session_start_gives_context_and_env(self):
+        out = wh.cursor_session_start_output("abc", "Whales capture is active.", "cur")
+        assert set(out) == {"additional_context", "env"}
+        assert out["env"] == {"WHALES_CLIENT_SESSION_ID": "cur:abc"}
+        assert "Cursor session id is `cur:abc`" in out["additional_context"]
+        assert out["additional_context"].startswith("Whales capture is active.")
+
+    # -- postToolUse (DesignContext) ------------------------------------------
+
+    @pytest.mark.parametrize("path,kind", [
+        ("/w/landing.html", "page"), ("/w/landing.HTM", "page"),
+        ("/w/shot.png", "image"), ("/w/shot.webp", "image"),
+    ])
+    def test_a_critiquable_file_is_named_with_its_upload_command(self, path, kind):
+        text = wh.cursor_design_context({"tool_name": "Write", "tool_input": {"file_path": path}})
+        assert f"this {kind} was written at `{path}`" in text
+        assert f'critique_source.py upload "{path}"' in text
+        assert "`source_id`" in text and "universal_critique" in text
+
+    def test_a_canvas_is_not_a_critique_source(self):
+        text = wh.cursor_design_context({"file_path": "/w/board.canvas.tsx"})
+        assert "not something Whales can critique" in text
+        assert "upload" not in text
+
+    def test_other_files_get_no_context(self):
+        assert wh.cursor_design_context({"tool_input": {"path": "/w/app.ts"}}) == ""
+
+    def test_design_context_prints_context_and_never_posts(self, tmp_path):
+        server, received = _serve(200)
+        (tmp_path / ".whales").mkdir()
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        r = self._run("DesignContext",
+                      {"conversation_id": "c", "tool_name": "Write",
+                       "tool_input": json.dumps({"file_path": "/w/a.html"})}, tmp_path)
+        assert r.returncode == 0
+        assert "critique_source.py upload" in json.loads(r.stdout)["additional_context"]
+        _wait_for(received, timeout=1.0)
+        assert "body" not in received, "afterFileEdit already records the write"
+
+    def test_design_context_is_cursor_only(self, tmp_path):
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--event", "DesignContext"],
+            input=json.dumps({"tool_input": {"file_path": "/w/a.html"}}),
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20)
+        assert r.returncode == 0 and r.stdout.strip() == ""
+
+    # -- the one list of Cursor events ----------------------------------------
+
+    def test_cursor_hooks_json_is_the_full_event_list_and_runs_the_wrapper(self):
+        import re
+
+        cfg = json.loads((HOOK.parents[1] / "cursor" / "hooks.json").read_text())
+        assert cfg["version"] == 1
+        events = cfg["hooks"]
+        assert set(events) == {"sessionStart", "sessionEnd", "beforeSubmitPrompt", "afterFileEdit",
+                               "preToolUse", "postToolUse", "preCompact", "stop"}
+        known = {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse", "PreToolUse",
+                 "DesignContext", "PreCompact", "Stop"}
+        for name, entries in events.items():
+            assert len(entries) == 1, name
+            command = entries[0]["command"]
+            m = re.fullmatch(r'python3 "\$\{HOME\}/\.whales/scripts/whales_hook\.py" '
+                             r'--event (\w+) --source cursor_hook', command)
+            assert m and m.group(1) in known, command
+        assert events["postToolUse"][0]["matcher"] == "Write"
+        assert "DesignContext" in events["postToolUse"][0]["command"]
+        assert "matcher" not in events["preToolUse"][0]

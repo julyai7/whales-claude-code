@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event SessionStart --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event SessionEnd --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event UserPromptSubmit --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event PostToolUse --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event PreToolUse --source cursor_hook",
+        "timeout": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event DesignContext --source cursor_hook",
+        "matcher": "Write",
+        "timeout": 5
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event PreCompact --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event Stop --source cursor_hook",
+        "timeout": 10
+      }
+    ]
+  }
+}
