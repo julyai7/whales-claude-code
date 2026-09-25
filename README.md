@@ -32,7 +32,7 @@ plugin's `settings.json`; only `agent` and `subagentStatusLine` take effect
 there (checked 2026-09-24 on 2.1.282: a plugin-allowed command still needed
 approval, while the same rule passed via `--allowedTools` did not). The Whales
 installer adds the read-and-record tools to the designer's own
-`~/.claude/settings.json` instead — see `WHALES_ALLOW_RULES` in the installer
+`~/.claude/settings.json` instead — see `WHALES_ALLOW_TOOLS` in the installer
 for the list and the reasons for what it leaves out.
 
 ## Why hooks and not just an MCP server
