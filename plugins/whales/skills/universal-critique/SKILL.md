@@ -61,8 +61,9 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 ## 4. Generate — only when asked
 
-1. Call `get_rebuild_contract` (surface `host-agent`) before writing anything,
-   and follow it.
+1. Call `get_rebuild_contract` (surface `host-agent`, and the `critique_id`
+   from this critique) before writing anything, and follow it. The id is how
+   the measured layout is included.
 2. Rebuild from the critiqued screen itself:
    - a screenshot → the file the designer gave you;
    - a web page or Figma file → the exact images that were critiqued, one per
@@ -74,6 +75,9 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 3. Don't call `get_design_profile` or restyle the screen into the designer's own
    conventions unless they ask in so many words. The critiqued screen wins.
 4. Don't call `submit_design` for this rebuild.
+5. Call `self_critique` with the HTML and the same `critique_id`. Fix every
+   violation it reports, then call it again. At most three rounds. A page
+   that has never passed it is not finished. Say what is still open.
 
 ## Other results
 
