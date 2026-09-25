@@ -24,7 +24,7 @@ isn't a TTY, which is the case inside `curl | bash`.
 | | |
 |---|---|
 | **MCP server** | The Whales gateway over streamable HTTP, authenticated with `${user_config.whales_token}` |
-| **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system) |
+| **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system), `universal-critique` (Whales critiques a screen; its `critique_source.py` uploads the file itself) |
 | **Agent** | `design-review` — conformance-checks a diff in its own context |
 | **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd; PreToolUse on Whales tools adds `client_session_id` |
 **Permissions are not in the plugin.** Claude Code ignores `permissions` in a
@@ -99,6 +99,47 @@ improves from real work. Specifics:
   get through.
 - **Off switch:** `export WHALES_CAPTURE=off`. To stop entirely,
   `claude plugin uninstall whales` and delete `~/.whales/`.
+
+## Critique sources: the file itself, never a copy
+
+`universal_critique` and `self_critique` take a `source_id`, and
+`skills/universal-critique/critique_source.py upload <path>` is how a file on
+the designer's machine becomes one. An image is sent as it is. An HTML page is
+sent as one self-contained file: everything it loads from this machine
+(images, `srcset`, stylesheets and their own `url()`/`@import`, scripts,
+fonts) is inlined, because Whales renders the page on its own server, where
+the page's neighbouring files do not exist. Internet references are left for
+Whales to load. The script prints what it bundled, what it could not find
+(`missing`) and how many internet references it left as they are — nothing is
+dropped silently.
+
+The point is that the model never retypes a page into a tool call. That is
+slow and costly (two photos as base64 are about 45k output tokens), and what
+arrives is the model's copy, not the file. Pasted HTML is saved to a file once
+and uploaded like any other.
+
+## Cursor
+
+Cursor runs the same capture script, but not from this plugin's `hooks.json`.
+Cursor does load a Claude Code plugin it finds, but it drops the `args` that
+carry `--event`, so those firings exit quietly on purpose (see the script's
+docstring). Its real hooks are in `~/.cursor/hooks.json`, which the Whales
+installer writes from **`plugins/whales/cursor/hooks.json` — the one list of
+Cursor events**:
+
+| Cursor event | `--event` | What it does |
+|---|---|---|
+| `sessionStart` | `SessionStart` | Tells the model its `cur:<id>` (`additional_context`) and sets `WHALES_CLIENT_SESSION_ID` for later hooks (`env`) |
+| `beforeSubmitPrompt`, `afterFileEdit`, `preCompact`, `stop`, `sessionEnd` | as in Claude Code | Capture, same as Claude Code |
+| `preToolUse` | `PreToolUse` | Adds `client_session_id` to Whales tool calls through `updated_input`; no `permission`, so the designer's own rules apply |
+| `postToolUse` (`Write`) | `DesignContext` | Context only: names a page or image just written and the upload command for it, so "critique this" uploads that file instead of drawing a stand-in. A canvas is said not to be a critique source |
+
+Each entry runs `~/.whales/scripts/whales_hook.py`, a small wrapper the
+installer writes. It runs `capture_hook.py` (this plugin's `whales_hook.py`,
+copied beside it) and, at most once a day, updates the plugin, that copy,
+`critique_source.py` and the Whales entries in `~/.cursor/hooks.json` when a
+new version is published. So a change to this file reaches Cursor on the next
+version bump, with no re-install.
 
 ## Credential
 
