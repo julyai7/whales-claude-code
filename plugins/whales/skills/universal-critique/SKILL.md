@@ -15,11 +15,6 @@ version. Pass `client_session_id` on every call.
 **A web page or a Figma link** — nothing to upload. Call `universal_critique`
 with `url`. A Figma link critiques every screen in the file.
 
-**HTML already in this session** — a page you just wrote, or the designer
-pasted. Call `universal_critique` with that markup as `html`. Do not
-screenshot a recreation of it, and do not draw a second page that stands in
-for the one already written.
-
 **A screenshot** — upload it first with the script beside this skill (in this
 skill's base directory):
 
@@ -31,7 +26,6 @@ It prints JSON with a `source_id`. Call `universal_critique` with that
 `source_id` (and `filename`).
 
 Where the image path comes from:
-- **An image file already in this session**: the path you wrote. Upload that file. Do not redraw it.
 - **Dragged in from Finder**: the path is in the designer's message as text.
   That is the original file — the best source.
 - **Pasted**: Claude Code saved it to disk and gave you its path beside the
@@ -67,8 +61,9 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 ## 4. Generate — only when asked
 
-1. Call `get_rebuild_contract` (surface `host-agent`) before writing anything,
-   and follow it.
+1. Call `get_rebuild_contract` (surface `host-agent`, and the `critique_id`
+   from this critique) before writing anything, and follow it. The id is how
+   the measured layout is included.
 2. Rebuild from the critiqued screen itself:
    - a screenshot → the file the designer gave you;
    - a web page or Figma file → the exact images that were critiqued, one per
@@ -80,9 +75,9 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 3. Don't call `get_design_profile` or restyle the screen into the designer's own
    conventions unless they ask in so many words. The critiqued screen wins.
 4. Don't call `submit_design` for this rebuild.
-5. In that same turn, open the rendered image so the designer sees the screen.
-   On Cursor, open the PNG. Do not open the HTML as the thing they look at —
-   that opens source, and it reads as if nothing was generated.
+5. Call `self_critique` with the HTML and the same `critique_id`. Fix every
+   violation it reports, then call it again. At most three rounds. A page
+   that has never passed it is not finished. Say what is still open.
 
 ## Other results
 
