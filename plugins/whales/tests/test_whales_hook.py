@@ -457,11 +457,33 @@ class TestBackfill:
         (project / "subagents" / "agent-1.jsonl").write_text('{"sub": 1}\n')
         return server, bodies, project
 
-    def _run(self, home, *flags):
+    def _run(self, home, *flags, scope=("--since", "2000-01-01", "--all-projects"), cwd=None):
         return subprocess.run(
-            [sys.executable, str(HOOK), "--backfill", *flags],
+            [sys.executable, str(HOOK), "--backfill", *scope, *flags],
             capture_output=True, text=True, env=dict(os.environ, HOME=str(home)), timeout=20,
+            cwd=cwd,
         )
+
+    def test_since_is_required(self, tmp_path):
+        server, bodies, _ = self._setup(tmp_path, 200)
+        try:
+            r = self._run(tmp_path, scope=("--all-projects",))
+        finally:
+            server.shutdown()
+        assert bodies == [] and "pass --since" in r.stdout
+
+    def test_only_this_directorys_sessions_by_default(self, tmp_path):
+        server, bodies, project = self._setup(tmp_path, 200)
+        here = tmp_path / "work" / "Koi app"
+        here.mkdir(parents=True)
+        mine = project.parent / wh.re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(here))
+        mine.mkdir()
+        (mine / "koi1.jsonl").write_text('{"k": 1}\n')
+        try:
+            self._run(tmp_path, scope=("--since", "2000-01-01"), cwd=str(here))
+        finally:
+            server.shutdown()
+        assert [b["session_id"] for b in bodies] == ["cc:koi1"], "another project's sess1 stays home"
 
     def test_ships_past_sessions_but_not_subagent_transcripts(self, tmp_path):
         server, bodies, _ = self._setup(tmp_path, 200)
@@ -722,3 +744,127 @@ class TestSessionIdInjection:
         self._run(self._event("mcp__whales__submit_design"), tmp_path)
         _wait_for(received, timeout=1.0)
         assert "body" not in received, "PreToolUse rewrites arguments; it is not a capture event"
+
+
+class TestOneUploadPerSession:
+    """A burst of events must not ship the same transcript bytes more than
+    once, and the end of a long session must not wait for events that never
+    come."""
+
+    def test_the_lock_is_exclusive_until_released(self, whales_home):
+        first = wh.acquire_upload_lock("s1")
+        assert first and wh.acquire_upload_lock("s1") is None
+        wh.release_upload_lock(first)
+        assert wh.acquire_upload_lock("s1")
+
+    def test_a_lock_left_by_a_dead_upload_is_taken_over(self, whales_home):
+        stale = wh.acquire_upload_lock("s1")
+        old = os.path.getmtime(stale) - wh._LOCK_STALE_SECONDS - 5
+        os.utime(stale, (old, old))
+        assert wh.acquire_upload_lock("s1")
+
+    def test_an_event_during_an_upload_goes_without_the_transcript(self, tmp_path):
+        server, received = _serve(200)
+        (tmp_path / ".whales" / "offsets").mkdir(parents=True)
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        (tmp_path / ".whales" / "offsets" / "abc.lock").write_text("123")
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("in flight\n")
+        subprocess.run(
+            [sys.executable, str(HOOK), "--event", "PostToolUse"],
+            input=json.dumps({"session_id": "abc", "transcript_path": str(transcript)}),
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20,
+        )
+        _wait_for(received)
+        assert "transcript_delta" not in received["body"]["raw_payload"]
+        assert received["body"]["raw_payload"]["whales_event"] == "PostToolUse"
+        assert (tmp_path / ".whales" / "offsets" / "abc.lock").exists(), "not ours to release"
+
+    def test_an_accepted_upload_drains_the_rest_and_releases_the_lock(self, whales_home):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        bodies = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                bodies.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        t = whales_home / "t.jsonl"
+        line = "x" * 1000 + "\n"
+        t.write_text(line * 1300)  # ~1.3MB: three chunks
+        try:
+            lock = wh.acquire_upload_lock("s1")
+            text, end, more, start = wh.transcript_delta(str(t), "s1")
+            assert more
+            wh.deliver(f"http://127.0.0.1:{server.server_address[1]}", "tok", b"{}", "s1", end,
+                       str(t), chunk_start=start, lock=lock, drain_to=("claude_code_hook", "cc:s1"))
+        finally:
+            server.shutdown()
+        assert len(bodies) == 3
+        ranges = [b["raw_payload"]["transcript_delta_range"] for b in bodies[1:]]
+        assert ranges[0][0] == end and ranges[-1][1] == t.stat().st_size
+        assert {b["raw_payload"]["hook_event_name"] for b in bodies[1:]} == {"TranscriptChunk"}
+        assert wh.transcript_delta(str(t), "s1")[0] == ""
+        assert not os.path.exists(wh._lock_path("s1"))
+
+
+class TestChunkBackoff:
+    def test_a_new_chunk_is_sent(self):
+        assert wh.chunk_decision({}, 0, 1000.0) == "send"
+        assert wh.chunk_decision({"start": 5, "count": 9, "status": 500, "at": 1000.0}, 0, 1000.0) == "send"
+
+    def test_a_failed_chunk_waits_longer_each_time(self):
+        once = {"start": 0, "count": 1, "status": 503, "at": 1000.0}
+        assert wh.chunk_decision(once, 0, 1010.0) == "wait"
+        assert wh.chunk_decision(once, 0, 1031.0) == "send"
+        thrice = {**once, "count": 3}
+        assert wh.chunk_decision(thrice, 0, 1100.0) == "wait"  # 120s
+        assert wh.chunk_decision({**once, "count": 30}, 0, 1000.0 + 1801) == "send"  # capped
+
+    def test_an_outage_never_skips_but_a_malformed_chunk_does(self):
+        assert wh.chunk_decision({"start": 0, "count": 50, "status": 502, "at": 0}, 0, 10.0**9) == "send"
+        assert wh.chunk_decision({"start": 0, "count": 3, "status": 413, "at": 0}, 0, 1.0) == "skip"
+        assert wh.chunk_decision({"start": 0, "count": 3, "status": 429, "at": 0}, 0, 10.0**9) == "send"
+
+    def test_a_failed_chunk_is_counted_and_an_accepted_one_clears_it(self, whales_home):
+        t = whales_home / "t.jsonl"
+        t.write_text("line\n")
+        server, _ = _serve(500)
+        wh.deliver(f"http://127.0.0.1:{server.server_address[1]}", "tok", b"{}", "s1",
+                   t.stat().st_size, str(t), chunk_start=0)
+        assert wh.read_chunk_failure("s1")["count"] == 1
+        wh.record_chunk_failure("s1", 0, 500)
+        assert wh.read_chunk_failure("s1")["count"] == 2
+        server, _ = _serve(200)
+        wh.deliver(f"http://127.0.0.1:{server.server_address[1]}", "tok", b"{}", "s1",
+                   t.stat().st_size, str(t), chunk_start=0)
+        assert wh.read_chunk_failure("s1") == {}
+
+    def test_a_chunk_rejected_three_times_is_skipped_and_reported(self, tmp_path):
+        server, received = _serve(200)
+        offsets = tmp_path / ".whales" / "offsets"
+        offsets.mkdir(parents=True)
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        (offsets / "abc.fail").write_text(json.dumps({"start": 0, "count": 3, "status": 422, "at": 0}))
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("poison\n")
+        subprocess.run(
+            [sys.executable, str(HOOK), "--event", "Stop"],
+            input=json.dumps({"session_id": "abc", "transcript_path": str(transcript)}),
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20,
+        )
+        _wait_for(received)
+        raw = received["body"]["raw_payload"]
+        assert raw["transcript_skipped"] == {"range": [0, len("poison\n")], "http_status": 422, "attempts": 3}
+        assert "transcript_delta" not in raw
+        assert (offsets / "abc.offset").read_text() == str(len("poison\n"))
