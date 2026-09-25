@@ -82,7 +82,8 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
    `critique_id`, before writing anything, and follow it. The id is how the
    layout Whales already measured is included.
 2. Rebuild from the critiqued screen itself:
-   - an HTML page → edit from the designer's own file, not a copy of it;
+   - an HTML page → start from a copy of the designer's own file (never a
+     recreation of it);
    - a screenshot → the file the designer gave you;
    - a web page, Figma file or HTML page with `renders` → the exact images
      that were critiqued, one per entry in `renders`:
@@ -93,13 +94,18 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 3. Don't call `get_design_profile` or restyle the screen into the designer's
    own conventions unless they ask in so many words. The critiqued screen wins.
 4. Don't call `submit_design` for this rebuild.
-5. Write the page to disk. Upload that file with `critique_source.py upload`,
+5. Write the rebuild as **new files** beside the original — for example
+   `index.whales.html`, and a new stylesheet if the styles change. Never
+   modify the designer's own files (the page, its stylesheets, its images)
+   unless they ask you to in so many words: the original is what they compare
+   the rebuild against, and what a later critique should run on.
+6. Upload the rebuilt file with `critique_source.py upload`,
    and call `self_critique` with the `source_id` it prints, the same
    `critique_id`, and — when the critique had several screens (`renders`) —
    the `screen` index you rebuilt. Fix every violation it reports, save,
    upload again and call it again: at most three rounds. A page that has
    never passed it is not finished; say what is still open.
-6. In that same turn, show the designer the rendered screen: open the PNG of
+7. In that same turn, show the designer the rendered screen: open the PNG of
    the page. On Cursor, open the PNG, not the HTML file — that opens its
    source, and it reads as if nothing was generated.
 
