@@ -63,7 +63,9 @@ improves from real work. Specifics:
   `~/.whales/offsets/`; each event ships only what was appended since the
   last one, 512KB per upload, oldest first. The offset moves only after the
   gateway accepts the upload, so a failed upload is re-sent later instead of
-  lost. One upload per session runs at a time (a lock under
+  lost. A re-send carries exactly the same bytes, marked `transcript_resend`,
+  so the backend can drop it when the first attempt did arrive and only its
+  answer was lost. One upload per session runs at a time (a lock under
   `~/.whales/offsets/`), and it keeps going until the transcript is caught
   up, so the end of a session is not left waiting for events that never
   come.
@@ -74,6 +76,8 @@ improves from real work. Specifics:
 - **Backfill is scoped.** `whales_hook.py --backfill --since YYYY-MM-DD`
   re-sends the unshipped transcript of past sessions started in the current
   directory; `--all-projects` widens it. There is no "everything" default.
+  `--from-start` re-sends from the beginning of each transcript, and parts
+  that had already arrived are stored again: the backend cannot match them.
 - **Secrets are scrubbed before sending.** Common credential shapes — API
   keys, tokens, private key blocks, `SECRET=`-style assignments — are
   replaced. This is a regex, not a guarantee; it is here because a capture

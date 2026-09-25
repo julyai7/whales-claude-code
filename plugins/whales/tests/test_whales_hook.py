@@ -810,3 +810,93 @@ class TestChunkBackoff:
         assert raw["transcript_skipped"] == {"range": [0, len("poison\n")], "http_status": 422, "attempts": 3}
         assert "transcript_delta" not in raw
         assert (offsets / "abc.offset").read_text() == str(len("poison\n"))
+
+
+class TestRetrySendsTheSameBytes:
+    """A retry must carry exactly the failed range: when the first attempt
+    reached the gateway and only its answer was lost, an identical range is
+    the only way the backend can tell the repeat apart."""
+
+    def test_the_failed_range_is_recorded(self, whales_home):
+        t = whales_home / "t.jsonl"
+        t.write_text("first\n")
+        wh.deliver("http://127.0.0.1:9", "tok", b"{}", "s1", t.stat().st_size, str(t), chunk_start=0)
+        assert wh.read_chunk_failure("s1")["end"] == len("first\n")
+
+    def test_a_retry_resends_the_same_range_although_the_file_grew(self, tmp_path):
+        server, received = _serve(200)
+        offsets = tmp_path / ".whales" / "offsets"
+        offsets.mkdir(parents=True)
+        (tmp_path / ".whales" / "token").write_text("tok")
+        (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("first\nsecond, written after the failed attempt\n")
+        (offsets / "abc.fail").write_text(json.dumps(
+            {"start": 0, "end": len("first\n"), "count": 1, "status": None, "at": 0}))
+        subprocess.run(
+            [sys.executable, str(HOOK), "--event", "Stop"],
+            input=json.dumps({"session_id": "abc", "transcript_path": str(transcript)}),
+            capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20,
+        )
+        _wait_for(received)
+        raw = received["body"]["raw_payload"]
+        assert raw["transcript_delta"] == "first\n"
+        assert raw["transcript_delta_range"] == [0, len("first\n")]
+        assert raw["transcript_resend"] is True
+        assert raw["transcript_delta_truncated"] is True, "the rest follows"
+
+    def test_a_range_that_is_gone_is_not_resent(self, whales_home):
+        t = whales_home / "t.jsonl"
+        t.write_text("ab\n")
+        assert wh.transcript_range(str(t), 0, 50) == ""
+        assert wh.transcript_range(str(t), 0, 2) == "ab"
+
+
+def test_a_burst_of_events_ships_every_byte_once(tmp_path):
+    """Five hooks firing together (quick edits, then Stop) against one
+    transcript: the ranges that reach the gateway must not overlap, and
+    together must cover the file."""
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    ranges = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            span = body["raw_payload"].get("transcript_delta_range")
+            if span:
+                time.sleep(0.2)  # slow enough that the others fire mid-upload
+                ranges.append(tuple(span))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (tmp_path / ".whales").mkdir()
+    (tmp_path / ".whales" / "token").write_text("tok")
+    (tmp_path / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(("y" * 1000 + "\n") * 1200)  # ~1.2MB: three chunks
+    size = transcript.stat().st_size
+    procs = [subprocess.Popen(
+        [sys.executable, str(HOOK), "--event", event],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, HOME=str(tmp_path)),
+    ) for event in ("PostToolUse", "PostToolUse", "PostToolUse", "Stop", "SessionEnd")]
+    for p in procs:
+        p.communicate(json.dumps({"session_id": "abc", "transcript_path": str(transcript)}).encode(),
+                      timeout=20)
+    deadline = time.time() + 15
+    while sum(e - s for s, e in ranges) < size and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)  # anything shipped twice would land now
+    server.shutdown()
+    spans = sorted(ranges)
+    assert spans[0][0] == 0 and spans[-1][1] == size
+    for (_, end), (start, _) in zip(spans, spans[1:]):
+        assert end == start, f"overlap or gap in {spans}"
