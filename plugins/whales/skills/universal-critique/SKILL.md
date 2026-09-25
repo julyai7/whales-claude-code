@@ -1,6 +1,6 @@
 ---
 name: universal-critique
-description: Have Whales critique a screen the designer shares — a screenshot (pasted or dragged in), a live web page, or a Figma file — the same critique the Whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is Whales critiquing THEIR screen; recording the designer's own feedback on a design is `record_critique`, a different thing.
+description: Have Whales critique a screen the designer shares — a screenshot (pasted or dragged in), an HTML page, a live web page, or a Figma file — the same critique the Whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is Whales critiquing THEIR screen; recording the designer's own feedback on a design is `record_critique`, a different thing.
 ---
 
 # Universal critique
@@ -8,34 +8,51 @@ description: Have Whales critique a screen the designer shares — a screenshot 
 Whales critiques a screen in three steps, and you run them with the
 `universal_critique` tool: it settles what the screen is FOR, critiques it
 against that, and then — only if the designer asks — you generate an updated
-version. Pass `client_session_id` on every call.
+version and check it with `self_critique`. Pass `client_session_id` on every
+call.
+
+**The rule behind every step: Whales gets the real file.** Upload the file the
+designer has or you wrote. Never retype a page into a tool call, never
+recreate a screen to stand in for it, and never screenshot a copy.
+
+The upload script is `critique_source.py`:
+- in Claude Code, beside this skill: `"<this skill's base directory>/critique_source.py"`;
+- anywhere else (Cursor), where the Whales installer put it: `~/.whales/scripts/critique_source.py`.
+
+Below, `critique_source.py` means whichever of those applies.
 
 ## 1. Get the screen to Whales
 
-**A web page or a Figma link** — nothing to upload. Call `universal_critique`
-with `url`. A Figma link critiques every screen in the file.
-
-**A screenshot** — upload it first with the script beside this skill (in this
-skill's base directory):
+**An image or an HTML page on disk** — upload that file:
 
 ```bash
-python3 "<this skill's base directory>/critique_source.py" upload "<image path>"
+python3 critique_source.py upload "<path>"
 ```
 
 It prints JSON with a `source_id`. Call `universal_critique` with that
 `source_id` (and `filename`).
 
-Where the image path comes from:
-- **Dragged in from Finder**: the path is in the designer's message as text.
-  That is the original file — the best source.
-- **Pasted**: Claude Code saved it to disk and gave you its path beside the
-  image, as `[Image: source: <path>]`. Use that path. It is a reduced copy
-  (2000px on its long edge) — if the upload comes back `likely_downscaled`,
-  mention once that the original file would give a more accurate read of text
-  sizes and tap targets. Don't block on it.
+- **An HTML page** is sent with everything it loads from this machine —
+  images, stylesheets, scripts, fonts — bundled into the one file, so Whales
+  sees it as it renders here. Internet links are left for Whales to load.
+  If the result lists anything under `missing`, tell the designer those
+  files were not found, once; the critique still runs.
+- **HTML the designer pasted** — save it to a file once, exactly as pasted,
+  then upload that file.
+- **A file you wrote this session** — the path you wrote it to.
+- **Dragged in from Finder** — the path is in the designer's message as
+  text. That is the original file, the best source.
+- **A pasted screenshot** — Claude Code saved it to disk and gave you its path
+  beside the image, as `[Image: source: <path>]`. Use that path. It is a
+  reduced copy (2000px on its long edge): if the upload comes back
+  `likely_downscaled`, mention once that the original file would give a more
+  accurate read of text sizes and tap targets. Don't block on it.
+- **A Cursor canvas** has no image file, so it cannot be critiqued as it
+  stands. Say so; don't draw a substitute.
 
-Never take a screenshot of your own, or describe the image, in place of
-uploading what the designer gave you.
+**A live web page or a Figma link** — nothing to upload. Call
+`universal_critique` with `url`. A Figma link critiques every screen in the
+file.
 
 ## 2. Settle the goal
 
@@ -61,23 +78,30 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 ## 4. Generate — only when asked
 
-1. Call `get_rebuild_contract` (surface `host-agent`, and the `critique_id`
-   from this critique) before writing anything, and follow it. The id is how
-   the measured layout is included.
+1. Call `get_rebuild_contract` with surface `host-agent` and this critique's
+   `critique_id`, before writing anything, and follow it. The id is how the
+   layout Whales already measured is included.
 2. Rebuild from the critiqued screen itself:
+   - an HTML page → edit from the designer's own file, not a copy of it;
    - a screenshot → the file the designer gave you;
-   - a web page or Figma file → the exact images that were critiqued, one per
-     entry in `renders`:
+   - a web page, Figma file or HTML page with `renders` → the exact images
+     that were critiqued, one per entry in `renders`:
      ```bash
-     python3 "<this skill's base directory>/critique_source.py" fetch <critique_id> <index>
+     python3 critique_source.py fetch <critique_id> <index>
      ```
      Don't take a fresh screenshot — a live page can have changed since.
-3. Don't call `get_design_profile` or restyle the screen into the designer's own
-   conventions unless they ask in so many words. The critiqued screen wins.
+3. Don't call `get_design_profile` or restyle the screen into the designer's
+   own conventions unless they ask in so many words. The critiqued screen wins.
 4. Don't call `submit_design` for this rebuild.
-5. Call `self_critique` with the HTML and the same `critique_id`. Fix every
-   violation it reports, then call it again. At most three rounds. A page
-   that has never passed it is not finished. Say what is still open.
+5. Write the page to disk. Upload that file with `critique_source.py upload`,
+   and call `self_critique` with the `source_id` it prints, the same
+   `critique_id`, and — when the critique had several screens (`renders`) —
+   the `screen` index you rebuilt. Fix every violation it reports, save,
+   upload again and call it again: at most three rounds. A page that has
+   never passed it is not finished; say what is still open.
+6. In that same turn, show the designer the rendered screen: open the PNG of
+   the page. On Cursor, open the PNG, not the HTML file — that opens its
+   source, and it reads as if nothing was generated.
 
 ## Other results
 
