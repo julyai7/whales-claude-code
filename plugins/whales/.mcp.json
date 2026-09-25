@@ -4,7 +4,8 @@
       "type": "http",
       "url": "https://mcp.gojuly.ai/mcp",
       "headers": {
-        "Authorization": "Bearer ${user_config.whales_token}"
+        "Authorization": "Bearer ${user_config.whales_token}",
+        "X-Whales-Plugin-Version": "0.3.0"
       }
     }
   }
