@@ -120,9 +120,16 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
    the `screen` index you rebuilt. Fix every violation it reports, save,
    upload again and call it again: at most three rounds. A page that has
    never passed it is not finished; say what is still open.
-7. In that same turn, show the designer the rendered screen: open the PNG of
-   the page. On Cursor, open the PNG, not the HTML file — that opens its
-   source, and it reads as if nothing was generated.
+7. In that same turn, show the designer the critiqued screen and the rebuild
+   side by side. Pass the file you rebuilt from in step 2 as the before — the
+   real original, never a stand-in — and the rebuilt file as the after:
+   ```bash
+   python3 critique_source.py compare "<before>" "<rebuilt file>"
+   ```
+   Open the `png` it prints. On Cursor, open the PNG, not the HTML file — that
+   opens its source, and it reads as if nothing was generated. If `png` is
+   null (no Chrome-family browser was found), open the PNG of the rebuilt
+   page instead and give the comparison's `html` path.
 
 ## Other results
 

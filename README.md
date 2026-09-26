@@ -118,6 +118,13 @@ slow and costly (two photos as base64 are about 45k output tokens), and what
 arrives is the model's copy, not the file. Pasted HTML is saved to a file once
 and uploaded like any other.
 
+`critique_source.py compare <before> <after>` shows a critiqued screen and its
+rebuild side by side at the same height; each side is an image or an HTML page
+(bundled the same way as an upload). It writes one self-contained HTML file
+beside the after and, when Chrome, Chromium, Edge or Brave is installed (or
+named by `WHALES_BROWSER`), a PNG of it. Standard library only, like the rest
+of the script.
+
 ## Cursor
 
 Cursor runs the same capture script, but not from this plugin's `hooks.json`.
