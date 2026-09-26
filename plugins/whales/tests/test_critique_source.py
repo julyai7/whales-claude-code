@@ -306,3 +306,85 @@ def test_the_upload_sends_the_original_and_names_it(monkeypatch, cursor_paste, c
     assert sent == {"type": "image/png", "body": original}
     assert out["filename"] == "Meetup iOS 26.png"
     assert out["original"]["instead_of"] == str(copy)
+
+
+# ---------------------------------------------------------------------------
+# compare: a screen and its rebuild side by side
+# ---------------------------------------------------------------------------
+
+import html as html_lib
+import re
+import struct
+import zlib
+
+
+def _png(width, height):
+    """A real, decodable one-colour PNG, so a browser can lay it out too."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\x00" + b"\xff\xff\xff" * width for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def test_a_page_beside_a_portrait_screenshot_is_laid_out_at_phone_width(tmp_path):
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(_png(10, 20))
+    page = _page(tmp_path, '<img src="hero.png">', {"hero.png": PNG})
+    out, missing = critique_source.compare_page(str(shot), page)
+    assert 'data-width="390"' in out
+    assert "Before" in out and "After" in out
+    # The rebuilt page travels bundled, so it renders wherever this file is opened.
+    srcdoc = html_lib.unescape(re.search(r'srcdoc="([^"]*)"', out).group(1))
+    assert _data(PNG) in srcdoc
+    assert missing == []
+
+
+def test_a_landscape_screenshot_makes_the_page_a_desktop_one(tmp_path):
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(_png(30, 20))
+    page = _page(tmp_path, "<p>hi</p>")
+    assert 'data-width="1440"' in critique_source.compare_page(str(shot), page)[0]
+    assert 'data-width="800"' in critique_source.compare_page(str(shot), page, width=800)[0]
+
+
+def test_a_missing_file_in_either_page_is_reported(tmp_path):
+    page = _page(tmp_path, '<img src="gone.png">')
+    assert critique_source.compare_page(page, page)[1] == ["gone.png", "gone.png"]
+
+
+def test_a_file_that_is_neither_image_nor_page_is_refused(tmp_path, capsys):
+    notes = tmp_path / "notes.txt"
+    notes.write_text("hello")
+    with pytest.raises(SystemExit):
+        critique_source.compare_page(str(notes), str(notes))
+    assert "cannot be compared" in capsys.readouterr().out
+
+
+def test_without_a_browser_the_html_is_still_written(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(critique_source, "_browser", lambda: None)
+    before = tmp_path / "before.png"
+    before.write_bytes(_png(10, 20))
+    after = _page(tmp_path, "<p>after</p>")
+    critique_source.compare(str(before), after, None, None)
+    result = json.loads(capsys.readouterr().out)
+    assert result["html"] == str(tmp_path / "page.compare.html")
+    assert result["png"] is None and "WHALES_BROWSER" in result["note"]
+    assert (tmp_path / "page.compare.html").exists()
+
+
+def test_an_unknown_browser_override_is_not_used(monkeypatch):
+    monkeypatch.setenv("WHALES_BROWSER", "/no/such/browser")
+    assert critique_source._browser() is None
+
+
+@pytest.mark.skipif(critique_source._browser() is None, reason="no Chrome-family browser here")
+def test_the_png_is_both_panels_at_one_height(tmp_path, capsys):
+    before = tmp_path / "before.png"
+    before.write_bytes(_png(200, 400))
+    after = _page(tmp_path, '<body style="margin:0"><div style="height:800px;background:#08f"></div></body>')
+    critique_source.compare(str(before), after, None, None)
+    result = json.loads(capsys.readouterr().out)
+    size = critique_source._file_dimensions(result["png"])
+    # Both panels scaled to the taller one (800), side by side, plus captions and padding.
+    assert size[1] > 800 and size[0] > 2 * 200

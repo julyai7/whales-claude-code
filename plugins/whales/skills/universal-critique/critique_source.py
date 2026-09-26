@@ -22,6 +22,12 @@ the file itself travels:
         Downloads the exact image a critique ran on (screen `index` from the
         result's `renders`), for rebuilding from. Prints the saved path.
 
+    critique_source.py compare <before> <after> [--out PATH] [--width N]
+        Puts a screen and its rebuild side by side at the same height, each
+        an image or an HTML page. Writes one self-contained HTML file (beside
+        AFTER unless --out) and, when a Chrome-family browser is installed, a
+        PNG of it. Prints both paths; `png` is null when none could be made.
+
 Credential: `~/.whales/token`, written by the Whales installer — the same file
 the capture hooks read, and for the same reason: it keeps the token out of the
 command line, where it would land in the transcript and in `ps`. The gateway
@@ -35,10 +41,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
 import mimetypes
 import os
+import pathlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -528,6 +538,170 @@ def fetch(critique_id: str, index: int, out: str | None) -> None:
     print(json.dumps({"status": "ok", "path": out, "bytes": len(content)}))
 
 
+# ---------------------------------------------------------------------------
+# Before and after, side by side
+#
+# A rebuild is judged against the screen it came from, so the designer should
+# see the two together at the same height rather than flip between files.
+# Either side may be an image or an HTML page. A page is bundled exactly as for
+# upload and laid out in an iframe at a phone or desktop width, so its
+# neighbouring files load wherever the comparison is opened. The comparison is
+# one HTML file; when a Chrome-family browser is installed it is also rendered
+# to a PNG, which is what to show the designer (Cursor opens an HTML file as
+# its source, which reads as if nothing was made).
+# ---------------------------------------------------------------------------
+
+_BROWSERS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+)
+_BROWSER_COMMANDS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+                     "microsoft-edge", "brave-browser")
+_PHONE_WIDTH = 390
+_DESKTOP_WIDTH = 1440
+# Past this the PNG is mostly empty pixels; a phone screenshot is ~2600 tall.
+_MAX_COMPARE_HEIGHT = 2000
+_SIZE_ATTR = re.compile(r'data-whales-size="(\d+)x(\d+)"')
+
+# Scales every panel to one height once the pages inside the iframes have laid
+# out, then records the page's size for the screenshot pass to use.
+_COMPARE_SCRIPT = """
+window.addEventListener("load", () => {
+  const panels = [...document.querySelectorAll("figure > .panel")];
+  const natural = panels.map(el => {
+    if (el.tagName === "IMG") return [el.naturalWidth, el.naturalHeight];
+    const frame = el.querySelector("iframe");
+    const doc = frame.contentDocument;
+    const h = Math.max(doc.documentElement.scrollHeight, doc.body ? doc.body.scrollHeight : 0);
+    frame.style.height = h + "px";
+    return [Number(el.dataset.width), h];
+  });
+  const target = Math.min(Math.max(...natural.map(n => n[1])), %d);
+  panels.forEach((el, i) => {
+    const [w, h] = natural[i], s = target / h;
+    el.style.width = Math.round(w * s) + "px";
+    el.style.height = target + "px";
+    if (el.tagName !== "IMG") el.querySelector("iframe").style.transform = "scale(" + s + ")";
+  });
+  const page = document.documentElement;
+  document.body.setAttribute("data-whales-size", page.scrollWidth + "x" + page.scrollHeight);
+});
+""" % _MAX_COMPARE_HEIGHT
+
+_COMPARE_STYLE = """
+* { box-sizing: border-box; margin: 0; }
+body { display: inline-flex; gap: 48px; padding: 40px 48px 48px; background: #f2f2f4;
+       font: 20px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; color: #222; }
+figure { display: flex; flex-direction: column; gap: 16px; }
+figcaption b { font-size: 26px; margin-right: 10px; }
+figcaption span { color: #6b6b6b; }
+.panel { display: block; overflow: hidden; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+.panel iframe { border: 0; display: block; transform-origin: 0 0; }
+"""
+
+
+def _browser() -> str | None:
+    override = os.environ.get("WHALES_BROWSER")
+    if override:
+        return override if os.path.isfile(override) else shutil.which(override)
+    for path in _BROWSERS:
+        if os.path.isfile(path):
+            return path
+    for name in _BROWSER_COMMANDS:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _is_page(path: str) -> bool:
+    return path.lower().endswith(_PAGE_SUFFIXES)
+
+
+def _page_width(other: str, width: int | None) -> int:
+    """A page is laid out at `width`, else at the width its counterpart implies:
+    a landscape screenshot is a desktop page, anything else a phone."""
+    if width:
+        return width
+    size = None if _is_page(other) else _file_dimensions(other)
+    return _DESKTOP_WIDTH if size and size[0] > size[1] else _PHONE_WIDTH
+
+
+def _panel(path: str, label: str, width: int) -> tuple[str, list[str]]:
+    caption = f"<figcaption><b>{html.escape(label)}</b><span>{html.escape(os.path.basename(path))}</span></figcaption>"
+    if _is_page(path):
+        content, report = bundle_page(path)
+        doc = html.escape(content.decode("utf-8"), quote=True)
+        body = (f'<div class="panel" data-width="{width}">'
+                f'<iframe srcdoc="{doc}" width="{width}" scrolling="no"></iframe></div>')
+        return f"<figure>{caption}{body}</figure>", report["missing"]
+    with open(path, "rb") as fh:
+        content = fh.read()
+    if not _dimensions(content):
+        _fail(f"{path} is neither an image nor an HTML page, so it cannot be compared.")
+    uri = f"data:{_media_type(content, path)};base64,{base64.b64encode(content).decode('ascii')}"
+    return f'<figure>{caption}<img class="panel" src="{uri}" alt=""></figure>', []
+
+
+def compare_page(before: str, after: str, width: int | None = None) -> tuple[str, list[str]]:
+    """One self-contained HTML page showing `before` and `after` side by side,
+    and the local files either page referenced that could not be found."""
+    left, missing_before = _panel(before, "Before", _page_width(after, width))
+    right, missing_after = _panel(after, "After", _page_width(before, width))
+    page = (f'<!doctype html><html><head><meta charset="utf-8"><title>Before and after</title>'
+            f"<style>{_COMPARE_STYLE}</style></head><body>{left}{right}"
+            f"<script>{_COMPARE_SCRIPT}</script></body></html>")
+    return page, missing_before + missing_after
+
+
+def _render_png(browser: str, page_path: str, png_path: str) -> str | None:
+    """Screenshot the comparison at exactly its own size: one pass to lay it
+    out and read that size, a second to capture it."""
+    url = pathlib.Path(page_path).resolve().as_uri()
+    base = [browser, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+            "--force-device-scale-factor=1", "--virtual-time-budget=5000"]
+    try:
+        dom = subprocess.run(base + ["--window-size=1600,1200", "--dump-dom", url],
+                             capture_output=True, text=True, timeout=120).stdout
+        size = _SIZE_ATTR.search(dom)
+        if not size:
+            return None
+        subprocess.run(base + [f"--window-size={size.group(1)},{size.group(2)}",
+                               f"--screenshot={os.path.abspath(png_path)}", url],
+                       capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return png_path if os.path.isfile(png_path) else None
+
+
+def compare(before: str, after: str, out: str | None, width: int | None) -> None:
+    before, after = os.path.expanduser(before), os.path.expanduser(after)
+    for path in (before, after):
+        if not os.path.isfile(path):
+            _fail(f"Could not read {path}: no such file.")
+    if out is None:
+        out = os.path.splitext(after)[0] + ".compare.html"
+    page, missing = compare_page(before, after, width)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    result: dict = {"status": "ok", "html": out, "png": None}
+    browser = _browser()
+    if browser:
+        result["png"] = _render_png(browser, out, os.path.splitext(out)[0] + ".png")
+        if not result["png"]:
+            result["note"] = "The browser could not render the comparison; open the HTML file instead."
+    else:
+        result["note"] = ("No Chrome, Chromium, Edge or Brave was found to render a PNG "
+                          "(set WHALES_BROWSER to one); open the HTML file instead.")
+    if missing:
+        result["missing"] = missing
+    print(json.dumps(result))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -539,11 +713,19 @@ def main() -> None:
     fe.add_argument("critique_id")
     fe.add_argument("index", type=int)
     fe.add_argument("--out")
+    co = sub.add_parser("compare", help="show a screen and its rebuild side by side")
+    co.add_argument("before")
+    co.add_argument("after")
+    co.add_argument("--out", help="the comparison's HTML path (default: beside AFTER); the PNG goes beside it")
+    co.add_argument("--width", type=int,
+                    help="lay out an HTML side at this width (default: 390, or 1440 beside a landscape screenshot)")
     args = parser.parse_args()
     if args.command == "upload":
         upload(args.path, args.exact)
-    else:
+    elif args.command == "fetch":
         fetch(args.critique_id, args.index, args.out)
+    else:
+        compare(args.before, args.after, args.out, args.width)
 
 
 if __name__ == "__main__":

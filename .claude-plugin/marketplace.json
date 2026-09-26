@@ -10,7 +10,7 @@
       "name": "whales",
       "description": "Critiques the screens a designer shares, applies their established conventions when they ask for their own style, and captures how they actually work so the profile improves from real usage.",
       "source": "./plugins/whales",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "category": "design",
       "tags": ["design", "design-system", "figma", "mcp"]
     }
