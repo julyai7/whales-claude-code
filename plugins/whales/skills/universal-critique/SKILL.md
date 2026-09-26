@@ -92,7 +92,10 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 1. Call `get_rebuild_contract` with surface `host-agent` and this critique's
    `critique_id`, before writing anything, and follow it. The id is how the
-   layout Whales already measured is included.
+   layout Whales already measured is included. Whales' critique is the only
+   analysis: don't run measurements of your own to overrule a finding. If one
+   looks wrong, ask the designer before building it, marked "My read, not
+   Whales'", and do what they decide.
 2. Rebuild from the critiqued screen itself:
    - an HTML page → start from a copy of the designer's own file (never a
      recreation of it);
