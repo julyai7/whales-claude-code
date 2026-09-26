@@ -47,6 +47,18 @@ It prints JSON with a `source_id`. Call `universal_critique` with that
   reduced copy (2000px on its long edge): if the upload comes back
   `likely_downscaled`, mention once that the original file would give a more
   accurate read of text sizes and tap targets. Don't block on it.
+- **A screenshot pasted into Cursor** — Cursor gives you the path of a much
+  smaller JPEG copy (in the project's `assets/` folder, named
+  `<original name>-<uuid>.jpg`). Upload that path anyway: the script looks
+  for the original by name in Downloads, Desktop, Pictures and Documents and
+  sends it instead. If the result has `original`, tell the designer once which
+  file was used. If it has `reduced_copy`, the original was not found: ask the
+  designer for it (drag it in or give its path) before calling
+  `universal_critique`, because at that size the contrast and size
+  measurements come out wrong. If they have no original, upload with
+  `--exact` and say the pixel measurements may be off.
+- **Any upload that comes back `low_resolution`** — mention once that the
+  original file would give a more accurate critique. Don't block on it.
 - **A Cursor canvas** has no image file, so it cannot be critiqued as it
   stands. Say so; don't draw a substitute.
 
@@ -80,7 +92,10 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 1. Call `get_rebuild_contract` with surface `host-agent` and this critique's
    `critique_id`, before writing anything, and follow it. The id is how the
-   layout Whales already measured is included.
+   layout Whales already measured is included. Whales' critique is the only
+   analysis: don't run measurements of your own to overrule a finding. If one
+   looks wrong, ask the designer before building it, marked "My read, not
+   Whales'", and do what they decide.
 2. Rebuild from the critiqued screen itself:
    - an HTML page → start from a copy of the designer's own file (never a
      recreation of it);
