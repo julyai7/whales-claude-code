@@ -56,7 +56,8 @@ It prints JSON with a `source_id`. Call `universal_critique` with that
   designer for it (drag it in or give its path) before calling
   `universal_critique`, because at that size the contrast and size
   measurements come out wrong. If they have no original, upload with
-  `--exact` and say the pixel measurements may be off.
+  `--exact` and say the pixel measurements may be off. If it has
+  `original_too_large`, the reduced copy was sent: pass on its note once.
 - **Any upload that comes back `low_resolution`** — mention once that the
   original file would give a more accurate critique. Don't block on it.
 - **A Cursor canvas** has no image file, so it cannot be critiqued as it
@@ -99,7 +100,9 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 2. Rebuild from the critiqued screen itself:
    - an HTML page → start from a copy of the designer's own file (never a
      recreation of it);
-   - a screenshot → the file the designer gave you;
+   - a screenshot → the file that was uploaded: `original.path` if the upload
+     reported an `original`, otherwise the file the designer gave you. Whales'
+     measurements are in that file's pixels;
    - a web page, Figma file or HTML page with `renders` → the exact images
      that were critiqued, one per entry in `renders`:
      ```bash
