@@ -196,3 +196,113 @@ def test_an_image_upload_is_unchanged(monkeypatch, tmp_path, config, capsys):
     out = json.loads(capsys.readouterr().out)
     assert sent == {"type": "image/png", "body": PNG}
     assert "bundled" not in out
+
+
+# ---------------------------------------------------------------------------
+# Screenshots: the original, not Cursor's reduced copy
+# ---------------------------------------------------------------------------
+
+import struct
+
+UUID = "28a9df01-317b-47da-aa49-1036568cb657"
+
+
+def _png(width, height):
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height) + b"\x08\x02\x00\x00\x00"
+
+
+def _jpeg(width, height):
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof0 = b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
+    return b"\xff\xd8" + app0 + sof0 + b"\xff\xd9"
+
+
+def test_dimensions_are_read_from_each_format():
+    assert critique_source._dimensions(_png(1179, 2676)) == (1179, 2676)
+    assert critique_source._dimensions(_jpeg(451, 1024)) == (451, 1024)
+    assert critique_source._dimensions(b"GIF89a" + struct.pack("<HH", 30, 40)) == (30, 40)
+    vp8x = b"RIFF\x00\x00\x00\x00WEBPVP8X" + b"\x0a\x00\x00\x00" + b"\x00" * 4 + (880).to_bytes(3, "little") + (1999).to_bytes(3, "little")
+    assert critique_source._dimensions(vp8x) == (881, 2000)
+    assert critique_source._dimensions(b"not an image") is None
+
+
+@pytest.fixture
+def cursor_paste(monkeypatch, tmp_path):
+    """Cursor's reduced copy of a pasted screenshot, and a Downloads folder to find the original in."""
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    monkeypatch.setattr(critique_source, "SEARCH_DIRS", (str(downloads),))
+    assets = tmp_path / ".cursor" / "projects" / "Users-me-work-app" / "assets"
+    assets.mkdir(parents=True)
+    copy = assets / f"Meetup_iOS_26-{UUID}.jpg"
+    copy.write_bytes(_jpeg(451, 1024))
+    return copy, downloads
+
+
+def test_cursors_copy_is_swapped_for_the_original(cursor_paste):
+    copy, downloads = cursor_paste
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 2676))
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(downloads / "Meetup iOS 26.png")
+    assert report["original"]["size"] == [1179, 2676]
+    assert report["original"]["reduced_size"] == [451, 1024]
+    assert report["original"]["instead_of"] == str(copy)
+
+
+def test_a_same_named_image_of_another_shape_is_not_the_original(cursor_paste):
+    copy, downloads = cursor_paste
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(2000, 1200))
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(copy)
+    assert "reduced_copy" in report and "Meetup_iOS_26" in report["reduced_copy"]["note"]
+
+
+def test_no_original_found_says_to_ask_for_it(cursor_paste):
+    copy, _ = cursor_paste
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(copy)
+    assert report["reduced_copy"]["size"] == [451, 1024]
+    assert "Ask the designer" in report["reduced_copy"]["note"]
+
+
+def test_exact_sends_the_given_file(cursor_paste):
+    copy, downloads = cursor_paste
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 2676))
+    path, report = critique_source._pick_image(str(copy), exact=True)
+    assert path == str(copy)
+    assert "original" not in report
+
+
+def test_a_file_outside_cursors_folders_is_never_swapped(monkeypatch, tmp_path):
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 2676))
+    monkeypatch.setattr(critique_source, "SEARCH_DIRS", (str(downloads),))
+    mine = tmp_path / f"Meetup_iOS_26-{UUID}.png"
+    mine.write_bytes(_png(1080, 2451))
+    assert critique_source._pick_image(str(mine), exact=False) == (str(mine), {})
+
+
+def test_a_narrow_phone_screenshot_carries_a_warning(tmp_path):
+    shot = tmp_path / "shot.jpg"
+    shot.write_bytes(_jpeg(451, 1024))
+    path, report = critique_source._pick_image(str(shot), exact=False)
+    assert path == str(shot) and report["low_resolution"]["size"] == [451, 1024]
+
+
+def test_the_upload_sends_the_original_and_names_it(monkeypatch, cursor_paste, config, capsys):
+    copy, downloads = cursor_paste
+    original = _png(1179, 2676)
+    (downloads / "Meetup iOS 26.png").write_bytes(original)
+    sent = {}
+
+    def urlopen(req, timeout):
+        sent.update(type=req.get_header("Content-type"), body=req.data)
+        return _Response(b'{"source_id": "c.png", "width": 1179, "height": 2676}')
+
+    monkeypatch.setattr(critique_source.urllib.request, "urlopen", urlopen)
+    critique_source.upload(str(copy))
+    out = json.loads(capsys.readouterr().out)
+    assert sent == {"type": "image/png", "body": original}
+    assert out["filename"] == "Meetup iOS 26.png"
+    assert out["original"]["instead_of"] == str(copy)

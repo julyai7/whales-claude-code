@@ -10,7 +10,10 @@ the file itself travels:
         Sends one screenshot, or one HTML page, to Whales. Prints JSON with
         `source_id` — pass it to `universal_critique`, or to `self_critique`
         for a rebuilt page. For an image it also prints the size and
-        `likely_downscaled`. For a page it first bundles everything the page
+        `likely_downscaled`. Given Cursor's reduced copy of a pasted
+        screenshot, it sends the original instead when it can find it
+        (`original`), and says so when it cannot (`reduced_copy`); `--exact`
+        sends the given file as is. For a page it first bundles everything the page
         loads from this machine (images, stylesheets, scripts, fonts) into
         the one file it sends, and prints what it bundled, what it could not
         find, and how many internet references it left as they are.
@@ -113,6 +116,153 @@ def _request(req: urllib.request.Request) -> tuple[bytes, str]:
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         _fail(f"Could not reach Whales at {_gateway()}: {exc}")
     raise AssertionError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# Screenshots: send the original, not a reduced copy
+#
+# Cursor saves a pasted image as a small JPEG — a 1179x2676 PNG arrives as
+# 451x1024 — named "<original name>-<uuid>.jpg", in the project's `assets/`
+# folder (spaces turned to underscores) and in its workspaceStorage (spaces
+# kept). That copy is the only path the agent is given. Whales measures text
+# contrast and icon sizes in pixels, and at that size its numbers are wrong:
+# thin text blurs into its background and every icon falls under the size
+# floor. The original is usually still where the designer took it from, so it
+# is looked for by name and sent instead. `--exact` sends the given file as is.
+# ---------------------------------------------------------------------------
+
+_UUID_SUFFIX = re.compile(
+    r"^(?P<stem>.+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_CURSOR_COPY_DIRS = (("/.cursor/projects/", "/assets/"),
+                     ("/Cursor/User/workspaceStorage/", "/images/"))
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+SEARCH_DIRS = ("~/Downloads", "~/Desktop", "~/Pictures", "~/Documents")
+_SEARCH_DEPTH = 2
+# A phone screenshot narrower than this has lost most of its pixels (an iPhone
+# screenshot is 1080-1320 wide); the critique still runs, with a warning.
+_LOW_RES_WIDTH = 750
+
+
+def _dimensions(content: bytes) -> tuple[int, int] | None:
+    """Width and height from an image's header, for PNG, JPEG, GIF and WebP."""
+    if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
+        return int.from_bytes(content[16:20], "big"), int.from_bytes(content[20:24], "big")
+    if content[:6] in (b"GIF87a", b"GIF89a") and len(content) >= 10:
+        return int.from_bytes(content[6:8], "little"), int.from_bytes(content[8:10], "little")
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP" and len(content) >= 30:
+        chunk = content[12:16]
+        if chunk == b"VP8X":
+            return (int.from_bytes(content[24:27], "little") + 1,
+                    int.from_bytes(content[27:30], "little") + 1)
+        if chunk == b"VP8L":
+            bits = int.from_bytes(content[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8 ":
+            return (int.from_bytes(content[26:28], "little") & 0x3FFF,
+                    int.from_bytes(content[28:30], "little") & 0x3FFF)
+        return None
+    if content.startswith(b"\xff\xd8"):
+        i = 2
+        while i + 9 < len(content):
+            if content[i] != 0xFF:
+                i += 1
+                continue
+            marker = content[i + 1]
+            if marker == 0xFF:
+                i += 1
+                continue
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                return (int.from_bytes(content[i + 7:i + 9], "big"),
+                        int.from_bytes(content[i + 5:i + 7], "big"))
+            i += 2 + int.from_bytes(content[i + 2:i + 4], "big")
+    return None
+
+
+def _file_dimensions(path: str) -> tuple[int, int] | None:
+    try:
+        with open(path, "rb") as fh:
+            return _dimensions(fh.read())
+    except OSError:
+        return None
+
+
+def _name_key(name: str) -> str:
+    return " ".join(name.replace("_", " ").split()).casefold()
+
+
+def _cursor_copy_stem(path: str) -> str | None:
+    """The original file's name if `path` is Cursor's copy of a pasted image."""
+    full = os.path.abspath(path)
+    if not any(a in full and b in full for a, b in _CURSOR_COPY_DIRS):
+        return None
+    match = _UUID_SUFFIX.match(os.path.splitext(os.path.basename(full))[0])
+    return match.group("stem") if match else None
+
+
+def _candidates(stem: str):
+    key = _name_key(stem)
+    for top in SEARCH_DIRS:
+        top = os.path.expanduser(top)
+        base_depth = top.rstrip(os.sep).count(os.sep)
+        for root, dirs, files in os.walk(top):
+            if root.count(os.sep) - base_depth >= _SEARCH_DEPTH:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                base, ext = os.path.splitext(name)
+                if ext.lower() in _IMAGE_SUFFIXES and _name_key(base) == key:
+                    yield os.path.join(root, name)
+
+
+def _find_original(stem: str, reduced: tuple[int, int]) -> tuple[str, tuple[int, int]] | None:
+    """The largest same-named image with the copy's shape and more pixels."""
+    ratio = reduced[0] / reduced[1]
+    best = None
+    for path in _candidates(stem):
+        size = _file_dimensions(path)
+        if not size or size[0] <= reduced[0]:
+            continue
+        # The same screen has the same shape, within the resize's rounding.
+        if abs(size[0] / size[1] - ratio) > 0.02 * ratio:
+            continue
+        if best is None or size[0] > best[1][0]:
+            best = (path, size)
+    return best
+
+
+def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
+    """The file to send for `path`, and what to tell the agent about it."""
+    size = _file_dimensions(path)
+    if not size:
+        return path, {}
+    stem = None if exact else _cursor_copy_stem(path)
+    if stem:
+        found = _find_original(stem, size)
+        if found:
+            original, original_size = found
+            return original, {"original": {
+                "path": original, "size": list(original_size),
+                "instead_of": path, "reduced_size": list(size),
+            }}
+        return path, {"reduced_copy": {
+            "size": list(size),
+            "note": (f"This is Cursor's reduced copy of a pasted screenshot ({size[0]}x{size[1]}), "
+                     f"and no original named \"{stem}\" was found in {', '.join(SEARCH_DIRS)}. "
+                     "Whales measures text contrast and icon sizes in pixels, and at this size "
+                     "they come out wrong. Ask the designer to drag the original file in or give "
+                     "its path, and upload that instead."),
+        }}
+    if size[0] < _LOW_RES_WIDTH and size[1] > size[0] * 1.5:
+        return path, {"low_resolution": {
+            "size": list(size),
+            "note": (f"This phone screenshot is only {size[0]}px wide, so text contrast and icon "
+                     "sizes may be measured wrong. If the designer has the original file, it "
+                     "will give a more accurate critique."),
+        }}
+    return path, {}
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +476,7 @@ def bundle_page(path: str) -> tuple[bytes, dict]:
                      "external": bundle.external}
 
 
-def upload(path: str) -> None:
+def upload(path: str, exact: bool = False) -> None:
     path = os.path.expanduser(path)
     report: dict = {}
     try:
@@ -334,6 +484,7 @@ def upload(path: str) -> None:
             content, report = bundle_page(path)
             media = "text/html; charset=utf-8"
         else:
+            path, report = _pick_image(path, exact)
             with open(path, "rb") as fh:
                 content = fh.read()
             media = _media_type(content, path)
@@ -382,13 +533,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     up = sub.add_parser("upload", help="send a screenshot or an HTML page to Whales")
     up.add_argument("path")
+    up.add_argument("--exact", action="store_true",
+                    help="send this file as is, even if it is Cursor's reduced copy of a pasted image")
     fe = sub.add_parser("fetch", help="download the image a critique ran on")
     fe.add_argument("critique_id")
     fe.add_argument("index", type=int)
     fe.add_argument("--out")
     args = parser.parse_args()
     if args.command == "upload":
-        upload(args.path)
+        upload(args.path, args.exact)
     else:
         fetch(args.critique_id, args.index, args.out)
 
