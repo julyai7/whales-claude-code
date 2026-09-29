@@ -48,6 +48,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -947,6 +948,89 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
     return 0
 
 
+# Present in every Cursor wrapper the updater writes (plugin cursor/wrapper.py).
+_WRAPPER_MARKER = "WHALES_CURSOR_WRAPPER = 2"
+_UPDATER_URL = ("https://raw.githubusercontent.com/julyai7/whales-claude-code/main/"
+                "plugins/whales/scripts/whales_update.py")
+
+
+def _installed_plugin_root() -> str:
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(config, "plugins", "installed_plugins.json")) as fh:
+            for entry in json.load(fh)["plugins"]["whales@whales"]:
+                if entry.get("scope", "user") == "user" and os.path.isdir(entry["installPath"]):
+                    return entry["installPath"]
+    except Exception:  # noqa: BLE001 — no Claude Code install
+        pass
+    return ""
+
+
+def replace_old_cursor_wrapper() -> None:
+    """Moves a Cursor machine off the installer's old wrapper, with no
+    re-install. That wrapper updates this file (as capture_hook.py) once a
+    day but never itself, so the new updater and wrapper arrive through here:
+    when the wrapper beside this copy is the old one, start the updater,
+    which replaces it. Fetched from the plugin repo when there is no Claude
+    Code install to take it from. Never raises."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        wrapper = os.path.join(here, "whales_hook.py")
+        if os.path.basename(__file__) != "capture_hook.py" or not os.path.isfile(wrapper):
+            return
+        with open(wrapper) as fh:
+            if _WRAPPER_MARKER in fh.read():
+                return
+        root = _installed_plugin_root()
+        updater = os.path.join(root, "scripts", "whales_update.py") if root else ""
+        if not updater or not os.path.isfile(updater):
+            updater = os.path.join(here, "whales_update.py")
+            if not os.path.isfile(updater):
+                with urllib.request.urlopen(_UPDATER_URL, timeout=10) as resp:
+                    data = resp.read(2 * 1024 * 1024)
+                compile(data, updater, "exec")
+                tmp = updater + ".tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, updater)
+        subprocess.Popen([sys.executable, updater, "--session-start", "--host", "cursor"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001 — the next session start tries again
+        pass
+
+
+def restart_notice(session_id: str):
+    """Once per session, when the updater has installed a newer Whales than
+    the one this session loaded: tell the designer (not the model) to restart.
+    Only for an installed copy: a --plugin-dir session is meant to differ."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not session_id or f"{os.sep}plugins{os.sep}cache{os.sep}" not in here:
+        return None
+    try:
+        with open(os.path.join(here, "..", ".claude-plugin", "plugin.json")) as fh:
+            running = json.load(fh).get("version", "")
+        root = _installed_plugin_root()
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as fh:
+            installed = json.load(fh).get("version", "")
+    except Exception:  # noqa: BLE001
+        return None
+    if not running or not installed or running == installed:
+        return None
+    marker = os.path.join(CONFIG_DIR, "restart_notice")
+    if _read(marker) == f"{session_id} {installed}":
+        return None
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(marker, "w") as fh:
+            fh.write(f"{session_id} {installed}")
+    except OSError:
+        return None
+    return {"systemMessage": f"Whales {installed} is installed. Restart Claude Code to use it "
+                             f"(this session is on {running})."}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     # Not required: Cursor auto-discovers and runs Claude Code plugins'
@@ -975,6 +1059,9 @@ def main() -> int:
 
     if not args.event:
         return 0
+
+    if args.event == "SessionStart" and args.source == "cursor_hook":
+        replace_old_cursor_wrapper()
 
     prefix = SESSION_PREFIX[args.source]
 
@@ -1038,6 +1125,10 @@ def main() -> int:
                 "token. Re-run the Whales installer to refresh it."
             )
         print(json.dumps(out))
+    if args.event == "UserPromptSubmit" and args.source == "claude_code_hook":
+        notice = restart_notice(session_id)
+        if notice:
+            print(json.dumps(notice))
 
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
