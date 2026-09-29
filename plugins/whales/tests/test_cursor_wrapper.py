@@ -197,3 +197,60 @@ class TestRestartNotice:
     def test_nothing_for_a_plugin_dir_session(self, tmp_path):
         self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
         assert self._prompt(tmp_path, PLUGIN) == ""
+
+
+class TestRecoveringFromABrokenUpdater:
+    """A Cursor-only machine has one updater, the copy in ~/.whales. If a
+    release breaks it, it cannot update itself, so the wrapper fetches a
+    fresh one once it has gone days without succeeding."""
+
+    @pytest.fixture
+    def server(self):
+        import http.server
+        import threading
+        body = {"text": STUB_UPDATER.format(python=sys.executable).replace("updater_ran", "fresh_updater_ran")}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ok = self.path == "/scripts/whales_update.py"
+                self.send_response(200 if ok else 404)
+                self.end_headers()
+                self.wfile.write(body["text"].encode() if ok else b"")
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+        srv.shutdown()
+
+    def _state(self, home: Path, **state):
+        (home / ".whales" / "update_state.json").write_text(json.dumps(state))
+
+    def test_fetches_a_fresh_updater_after_days_of_failures(self, home, server):
+        (home / ".whales" / "plugin_source").write_text(server)
+        now = time.time()
+        self._state(home, last_check=now - 60, last_success=now - 4 * 86400)
+        _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
+        assert _wait((home / "fresh_updater_ran").exists)
+        state = json.loads((home / ".whales" / "update_state.json").read_text())
+        assert state["last_recover"] == pytest.approx(now, abs=30)
+
+    def test_leaves_a_working_updater_alone(self, home, server):
+        (home / ".whales" / "plugin_source").write_text(server)
+        now = time.time()
+        self._state(home, last_check=now - 60, last_success=now - 3600)
+        _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
+        assert _wait((home / "updater_ran").exists)
+        assert not (home / "fresh_updater_ran").exists()
+
+    def test_never_for_the_installed_plugins_updater(self, home, server):
+        """Claude Code machines are fixed by the plugin update itself."""
+        _installed_plugin(home)
+        (home / ".whales" / "plugin_source").write_text(server)
+        now = time.time()
+        self._state(home, last_check=now - 60, last_success=now - 4 * 86400)
+        _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
+        assert _wait((home / "updater_ran").exists)
+        assert not (home / "fresh_updater_ran").exists()

@@ -607,6 +607,8 @@ def run(host: str, force: bool = False) -> int:
         release_lock()
     result = "failed" if errors else ("updated" if changed else "current")
     error = "; ".join(errors)
+    if result != "failed":
+        write_state(last_success=time.time())
     write_state(last_run={
         "host": host, "started": started, "finished": time.time(), "result": result,
         "error": error,

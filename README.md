@@ -32,8 +32,40 @@ plugin's `settings.json`; only `agent` and `subagentStatusLine` take effect
 there (checked 2026-09-24 on 2.1.282: a plugin-allowed command still needed
 approval, while the same rule passed via `--allowedTools` did not). The Whales
 installer adds the read-and-record tools to the designer's own
-`~/.claude/settings.json` instead — see `WHALES_ALLOW_TOOLS` in the installer
-for the list and the reasons for what it leaves out.
+`~/.claude/settings.json` instead, and the updater adds any new ones on each
+release — see `ALLOW_TOOLS` in `scripts/whales_update.py` for the list and
+what it leaves out.
+
+## Updates: the installer runs once
+
+`scripts/whales_update.py` runs at every session start, in Claude Code (its
+own SessionStart hook) and in Cursor (the wrapper below). In a detached
+process, at most every 10 minutes, it:
+
+1. runs `claude plugin marketplace update whales` and, when the catalog lists
+   a different version, `claude plugin update whales@whales`. Different, not
+   higher: lowering the published version rolls everyone back.
+2. brings everything outside the plugin to the installed version, copied from
+   the installed plugin (never from the running session, so a `--plugin-dir`
+   session cannot publish unreleased code): the Cursor wrapper and capture
+   hook, `critique_source.py`, the updater itself, the `whales` command,
+   Whales' entries in `~/.cursor/hooks.json`, the version header in
+   `~/.cursor/mcp.json`, and the allow rules above.
+
+A new version loads when Claude Code or Cursor restarts; the next prompt in a
+session still on the old one says so. Claude Code's own auto-update stays on
+as a second way in if a release ever breaks the updater. Machines without
+Claude Code fetch the same files from this repo's `main`.
+
+**Releasing is merging a version bump to `main`.** Every installed machine
+picks it up at its next session start. There are no channels yet (JUL-652
+Phase 2), so test a release before merging: point your own install at the
+branch (edit `ref` under `extraKnownMarketplaces.whales.source` in
+`~/.claude/settings.json` **and** `whales.source` in
+`~/.claude/plugins/known_marketplaces.json`, then `whales update`), or run a
+checkout for one session with `claude --plugin-dir ./plugins/whales`.
+
+`touch ~/.whales/auto_update_off` stops it on a developer's machine.
 
 ## Why hooks and not just an MCP server
 
@@ -134,12 +166,31 @@ Cursor events**:
 | `preToolUse` | `PreToolUse` | Adds `client_session_id` to Whales tool calls through `updated_input`; no `permission`, so the designer's own rules apply |
 | `postToolUse` (`Write`) | `DesignContext` | Context only: names a page or image just written and the upload command for it, so "critique this" uploads that file instead of drawing a stand-in. A canvas is said not to be a critique source |
 
-Each entry runs `~/.whales/scripts/whales_hook.py`, a small wrapper the
-installer writes. It runs `capture_hook.py` (this plugin's `whales_hook.py`,
-copied beside it) and, at most once a day, updates the plugin, that copy,
-`critique_source.py` and the Whales entries in `~/.cursor/hooks.json` when a
-new version is published. So a change to this file reaches Cursor on the next
-version bump, with no re-install.
+Each entry runs `~/.whales/scripts/whales_hook.py`, the plugin's
+`cursor/wrapper.py` copied there by the updater. It runs `capture_hook.py`
+(this plugin's `whales_hook.py`, copied beside it) and, on a session start,
+the updater — the installed plugin's copy when there is one, so a release can
+fix a broken copy in `~/.whales`. A Cursor-only machine whose updater has not
+succeeded for three days downloads a fresh one first.
+
+Machines set up before 0.6.0 have the installer's old wrapper, which only
+updates `capture_hook.py`. The new `capture_hook.py` starts the updater when
+it sees that old wrapper beside it, and the updater replaces it: no
+re-install.
+
+## The `whales` command
+
+`~/.whales/bin/whales` (linked into `~/.local/bin` when that exists) runs
+`scripts/whales_cli.py`, which updates with the plugin:
+
+| | |
+|---|---|
+| `whales status` | versions per app, the server, and what the last update did |
+| `whales update` | check now instead of at the next session start |
+| `whales doctor [--fix]` | find, and repair, anything missing or out of date |
+| `whales logs` | the last update's output |
+| `whales install claude\|cursor` | connect another app with the token already here (runs the installer's `--only`) |
+| `whales uninstall [claude\|cursor]` | disconnect one app, or everything |
 
 ## Credential
 
@@ -157,7 +208,7 @@ dev machine at a local backend.
 ```bash
 claude plugin validate . --strict            # marketplace manifest
 claude plugin validate ./plugins/whales --strict
-python -m pytest plugins/whales/tests -q     # hook script
+python -m pytest plugins/whales/tests -q     # hook, updater, wrapper, CLI
 
 # try it without touching your real config:
 CLAUDE_CONFIG_DIR=$(mktemp -d) claude plugin marketplace add ./ \
