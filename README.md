@@ -58,7 +58,11 @@ as a second way in if a release ever breaks the updater. Machines without
 Claude Code fetch the same files from this repo's `main`.
 
 **Releasing is merging a version bump to `main`.** Every installed machine
-picks it up at its next session start. There are no channels yet (JUL-652
+picks it up at its next session start. Updates follow the published version
+**down** as well as up, so a plugin PR must bump *above whatever `main` has at
+merge time*: a branch cut before someone else's release, merged as is, rolls
+every designer back. Never below 0.6.0, the first version that updates itself
+(`tests/test_whales_update.py` checks that floor). There are no channels yet (JUL-652
 Phase 2), so test a release before merging: point your own install at the
 branch (edit `ref` under `extraKnownMarketplaces.whales.source` in
 `~/.claude/settings.json` **and** `whales.source` in

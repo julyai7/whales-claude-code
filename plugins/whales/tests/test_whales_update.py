@@ -32,7 +32,10 @@ with open(os.path.join(cfg, "claude_calls.jsonl"), "a") as fh:
                           "env": sorted(k for k in os.environ if k.startswith("CLAUDE"))}}) + "\\n")
 fake = json.load(open(os.path.join(cfg, "fake.json")))
 plugins = os.path.join(cfg, "plugins")
-if sys.argv[1:4] == ["plugin", "marketplace", "update"]:
+if sys.argv[1:4] == ["plugin", "list", "--json"]:
+    data = json.load(open(os.path.join(plugins, "installed_plugins.json")))
+    print(json.dumps([dict(id=k, **e) for k, v in data["plugins"].items() for e in v]))
+elif sys.argv[1:4] == ["plugin", "marketplace", "update"]:
     loc = json.load(open(os.path.join(plugins, "known_marketplaces.json")))["whales"]["installLocation"]
     os.makedirs(os.path.join(loc, ".claude-plugin"), exist_ok=True)
     json.dump({{"plugins": [{{"name": "whales", "version": fake["published"]}}]}},
@@ -274,6 +277,26 @@ class TestCursor:
         hooks = json.loads((cursor / "hooks.json").read_text())["hooks"]
         assert hooks == {"stop": [{"command": "someone-else.sh"}]}
 
+    def test_an_event_the_plugin_no_longer_lists_is_removed(self, m):
+        m.install_plugin("0.6.0", "0.6.0")
+        cursor = _cursor_machine(m)
+        wrapper = m.whales / "scripts" / "whales_hook.py"
+        cfg = json.loads((cursor / "hooks.json").read_text())
+        cfg["hooks"]["retiredEvent"] = [{"command": f"{wrapper} --event Stop --source cursor_hook"}]
+        cfg["hooks"]["beforeShellExecution"] = [{"command": "guard.sh"}]
+        (cursor / "hooks.json").write_text(json.dumps(cfg))
+        m.updater("--run", "--host", "cursor")
+        hooks = json.loads((cursor / "hooks.json").read_text())["hooks"]
+        assert "retiredEvent" not in hooks
+        assert hooks["beforeShellExecution"] == [{"command": "guard.sh"}]
+
+    def test_an_unreadable_hooks_file_is_left_alone(self, m):
+        m.install_plugin("0.6.0", "0.6.0")
+        cursor = _cursor_machine(m)
+        (cursor / "hooks.json").write_text("{ not json")
+        m.updater("--sync", "--enable-cursor-hooks")
+        assert (cursor / "hooks.json").read_text() == "{ not json"
+
     def test_cursor_only_machine_updates_from_the_repo(self, m, plugin_server):
         base, files = plugin_server
         _cursor_machine(m)
@@ -298,6 +321,61 @@ class TestCursor:
         assert not (m.whales / "scripts" / "whales_cli.py").exists()
         # The version is not marked done, so the next run tries again.
         assert not (m.whales / "scripts" / "capture_hook.version").exists()
+
+
+class TestTheInstallersOldWrapper:
+    """Every Cursor machine set up before 0.6.0 runs the installer's old
+    wrapper (tests/fixtures/old_cursor_wrapper.py, verbatim). It updates the
+    plugin and capture_hook.py once a day but never itself; the new capture
+    hook then starts the updater, which replaces it. No re-install."""
+
+    def test_old_wrapper_to_new_wrapper(self, m):
+        m.install_plugin("0.5.1", "0.6.0")
+        cursor = _cursor_machine(m)
+        scripts = m.whales / "scripts"
+        old = (PLUGIN / "tests" / "fixtures" / "old_cursor_wrapper.py").read_text().split("\n", 3)[3]
+        (scripts / "whales_hook.py").write_text(
+            old.replace("__WHALES_HOOK_SCRIPT_URL__", "http://127.0.0.1:9/scripts/whales_hook.py"))
+        (scripts / "capture_hook.py").write_text("import sys\n")  # the old capture hook: no catch-up
+        (scripts / "capture_hook.version").write_text("0.5.1")
+
+        def session(sid):
+            return subprocess.run([sys.executable, str(scripts / "whales_hook.py"),
+                                   "--event", "SessionStart", "--source", "cursor_hook"],
+                                  input=json.dumps({"conversation_id": sid}), capture_output=True,
+                                  text=True, env=m.env(), timeout=60)
+
+        # Day one: the old wrapper's daily update brings the plugin and a new
+        # capture hook, and nothing more.
+        assert session("one").returncode == 0
+        _wait(lambda: (scripts / "capture_hook.version").read_text() == "0.6.0")
+        assert m.installed() == "0.6.0"
+        assert MARKER not in (scripts / "whales_hook.py").read_text()
+
+        # The next session: the old wrapper runs the new capture hook, which
+        # starts the updater, which replaces the wrapper.
+        assert session("two").returncode == 0
+        _wait(lambda: MARKER in (scripts / "whales_hook.py").read_text())
+        _wait(lambda: m.state().get("last_run", {}).get("result") == "updated")
+        mcp = json.loads((cursor / "mcp.json").read_text())["mcpServers"]["whales"]
+        assert mcp["headers"]["X-Whales-Plugin-Version"] == "0.6.0"
+        hooks = json.loads((cursor / "hooks.json").read_text())["hooks"]
+        assert {"command": "someone-else.sh"} in hooks["stop"]
+
+        # And from then on the new wrapper runs Cursor's hooks.
+        r = session("three")
+        assert r.returncode == 0
+        assert "cur:three" in r.stdout
+
+
+class TestVersion:
+    def test_never_below_the_first_self_updating_release(self):
+        """Updates follow the published version down as well as up. A plugin
+        PR that merges with a version below main's (e.g. branched before
+        0.6.0) would roll every designer back — below 0.6.0, to a plugin that
+        cannot update itself. Every plugin PR bumps above main at merge."""
+        version = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())["version"]
+        assert tuple(map(int, version.split("."))) >= (0, 6, 0)
 
 
 @pytest.fixture

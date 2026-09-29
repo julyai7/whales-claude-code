@@ -254,3 +254,43 @@ class TestRecoveringFromABrokenUpdater:
         _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
         assert _wait((home / "updater_ran").exists)
         assert not (home / "fresh_updater_ran").exists()
+
+
+def test_old_wrapper_with_no_updater_downloads_it_in_the_background(tmp_path):
+    """A Cursor-only machine on the old wrapper has no updater anywhere: the
+    capture hook downloads it in a detached child, so the hook still returns
+    at once."""
+    import http.server
+    import threading
+
+    scripts = tmp_path / ".whales" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "whales_hook.py").write_text("# the installer's old wrapper\n")
+    shutil.copy(HOOK_SRC, scripts / "capture_hook.py")
+    body = STUB_UPDATER.format(python=sys.executable).encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(1)  # slower than the hook may take
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        env = dict(_env(tmp_path), WHALES_UPDATER_URL=f"http://127.0.0.1:{srv.server_address[1]}/u.py")
+        started = time.time()
+        r = subprocess.run([sys.executable, str(scripts / "capture_hook.py"), "--event", "SessionStart",
+                            "--source", "cursor_hook"], input="{}", capture_output=True, text=True,
+                           env=env, timeout=30)
+        assert r.returncode == 0
+        assert time.time() - started < 1
+        assert _wait((tmp_path / "updater_ran").exists)
+        assert (scripts / "whales_update.py").read_bytes() == body
+        assert "--session-start --host cursor" in (tmp_path / "updater_ran").read_text()
+    finally:
+        srv.shutdown()

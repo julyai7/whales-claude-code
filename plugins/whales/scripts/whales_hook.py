@@ -950,8 +950,9 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
 
 # Present in every Cursor wrapper the updater writes (plugin cursor/wrapper.py).
 _WRAPPER_MARKER = "WHALES_CURSOR_WRAPPER = 2"
-_UPDATER_URL = ("https://raw.githubusercontent.com/julyai7/whales-claude-code/main/"
-                "plugins/whales/scripts/whales_update.py")
+_UPDATER_URL = os.environ.get("WHALES_UPDATER_URL") or (
+    "https://raw.githubusercontent.com/julyai7/whales-claude-code/main/"
+    "plugins/whales/scripts/whales_update.py")
 
 
 def _installed_plugin_root() -> str:
@@ -966,13 +967,29 @@ def _installed_plugin_root() -> str:
     return ""
 
 
+# Run detached when there is no updater on the machine yet: download it, then
+# start it. In the child, so a slow download never holds up Cursor's hook.
+_FETCH_AND_RUN = """
+import os, subprocess, sys, urllib.request
+url, path = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(url, timeout=30) as resp:
+    data = resp.read(2 * 1024 * 1024)
+compile(data, path, "exec")
+with open(path + ".tmp", "wb") as fh:
+    fh.write(data)
+os.chmod(path + ".tmp", 0o755)
+os.replace(path + ".tmp", path)
+subprocess.run([sys.executable, path, "--session-start", "--host", "cursor"])
+"""
+
+
 def replace_old_cursor_wrapper() -> None:
     """Moves a Cursor machine off the installer's old wrapper, with no
     re-install. That wrapper updates this file (as capture_hook.py) once a
     day but never itself, so the new updater and wrapper arrive through here:
     when the wrapper beside this copy is the old one, start the updater,
-    which replaces it. Fetched from the plugin repo when there is no Claude
-    Code install to take it from. Never raises."""
+    which replaces it. Downloaded from the plugin repo when there is no
+    Claude Code install to take it from. Returns at once; never raises."""
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         wrapper = os.path.join(here, "whales_hook.py")
@@ -985,17 +1002,11 @@ def replace_old_cursor_wrapper() -> None:
         updater = os.path.join(root, "scripts", "whales_update.py") if root else ""
         if not updater or not os.path.isfile(updater):
             updater = os.path.join(here, "whales_update.py")
-            if not os.path.isfile(updater):
-                with urllib.request.urlopen(_UPDATER_URL, timeout=10) as resp:
-                    data = resp.read(2 * 1024 * 1024)
-                compile(data, updater, "exec")
-                tmp = updater + ".tmp"
-                with open(tmp, "wb") as fh:
-                    fh.write(data)
-                os.chmod(tmp, 0o755)
-                os.replace(tmp, updater)
-        subprocess.Popen([sys.executable, updater, "--session-start", "--host", "cursor"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        if os.path.isfile(updater):
+            cmd = [sys.executable, updater, "--session-start", "--host", "cursor"]
+        else:
+            cmd = [sys.executable, "-c", _FETCH_AND_RUN, _UPDATER_URL, updater]
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
     except Exception:  # noqa: BLE001 — the next session start tries again
         pass
