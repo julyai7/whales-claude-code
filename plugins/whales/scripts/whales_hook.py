@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Whales capture hook — forwards one Claude Code hook event to the gateway.
+"""whales capture hook — forwards one Claude Code hook event to the gateway.
 
 Runs on the DESIGNER'S machine, invoked by their editor on every turn, so the
 constraints here are different from the rest of the product:
@@ -71,7 +71,7 @@ APP_URL_FILE = os.path.join(CONFIG_DIR, "app_url")
 
 DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 
-# Whales tools that take ``client_session_id``, matched on the bare tool name
+# whales tools that take ``client_session_id``, matched on the bare tool name
 # because the server prefix differs by install (``mcp__whales__``,
 # ``mcp__plugin_whales_whales__``, a claude.ai connector's uuid). Kept in step
 # with the gateway's tool list. ``get_rebuild_contract`` is left out on
@@ -675,34 +675,34 @@ def _capture_lead(state: str, status: dict) -> str:
     actually doing, based on what the last upload did — never on whether a
     token file happens to exist."""
     if state == "active":
-        return (f"Whales capture is active for this session "
+        return (f"whales capture is active for this session "
                 f"(last upload confirmed {status.get('last_ok_at')}).")
     if state == "rejected":
         return (
-            f"Whales capture is failing on this machine: the Whales gateway has "
+            f"whales capture is failing on this machine: the whales gateway has "
             f"rejected its token since {status.get('first_failed_at')}, so "
             f"{status.get('failed_since_ok')} capture event(s) were not recorded. "
-            f"Tell the designer once, briefly, that Whales capture needs its "
+            f"Tell the designer once, briefly, that whales capture needs its "
             f"token refreshed: get a new install command from {new_token_page()} "
             f"and run it."
         )
     if state == "failing":
         reason = (status.get("last_error") or {}).get("reason") or "unreachable"
         return (
-            f"Whales capture is failing on this machine: uploads have failed since "
+            f"whales capture is failing on this machine: uploads have failed since "
             f"{status.get('first_failed_at')} ({reason}). Transcript is retried on "
             f"the next event, but {status.get('failed_since_ok')} event(s) were not "
             f"recorded."
         )
     if state == "unconfirmed":
-        return ("Whales capture is configured on this machine, but no upload has "
+        return ("whales capture is configured on this machine, but no upload has "
                 "been confirmed yet.")
     # Said plainly rather than omitted: the binding below is still worth
     # doing (tool calls work off the plugin's own credential, which is stored
     # separately from this file), but claiming capture is running when it is
     # not would make a silent misconfiguration look healthy.
-    return ("Whales is connected, but local capture is not configured on this "
-            "machine, so file edits made outside the Whales tools are not being "
+    return ("whales is connected, but local capture is not configured on this "
+            "machine, so file edits made outside the whales tools are not being "
             "recorded.")
 
 
@@ -714,20 +714,20 @@ def _session_start_context(session_id: str, lead: str, prefix: str) -> str:
     are different identifier spaces, so a design submitted through
     ``submit_design`` and then hand-edited with the native Write tool land in
     two buckets that can never be joined. The PreToolUse hook now adds the id
-    to every Whales call itself; asking the model to pass it stays as the
+    to every whales call itself; asking the model to pass it stays as the
     fallback for hosts that do not run that hook.
     """
     host = "Cursor" if prefix == "cur" else "Claude Code"
     return (
         f"{lead} Its {host} session id is `{prefix}:{session_id}`. "
         f"Pass that exact string as the `client_session_id` argument on every "
-        f"Whales MCP tool call you make in this session, so tool calls and file "
+        f"whales MCP tool call you make in this session, so tool calls and file "
         f"edits are recorded as one piece of work rather than two unrelated ones."
     )
 
 
 def session_id_injection(event: dict, prefix: str):
-    """The PreToolUse output that adds ``client_session_id`` to a Whales call,
+    """The PreToolUse output that adds ``client_session_id`` to a whales call,
     or ``None`` when there is nothing to do.
 
     Asking the model to pass the id did not work: the review behind this
@@ -790,7 +790,7 @@ def cursor_session_start_output(session_id: str, lead: str, prefix: str) -> dict
 
 
 def cursor_session_id_injection(event: dict, prefix: str):
-    """Cursor's preToolUse answer that adds ``client_session_id`` to a Whales
+    """Cursor's preToolUse answer that adds ``client_session_id`` to a whales
     call, or ``None``. The same job as ``session_id_injection``, in Cursor's
     shape: ``updated_input`` rather than Claude Code's wrapper.
 
@@ -814,7 +814,7 @@ _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
 def cursor_design_context(event: dict) -> str:
-    """What to tell the model after it wrote a file Whales could critique.
+    """What to tell the model after it wrote a file whales could critique.
 
     Cursor does not put a written file's path anywhere a later "critique
     this" can find it, so the agent used to draw a stand-in page and
@@ -826,15 +826,15 @@ def cursor_design_context(event: dict) -> str:
     lower = path.lower()
     if lower.endswith(".canvas.tsx"):
         return (
-            f"Whales: a canvas was just written at `{path}`. A canvas has no image "
-            f"file, so it is not something Whales can critique as it stands. Do "
+            f"whales: a canvas was just written at `{path}`. A canvas has no image "
+            f"file, so it is not something whales can critique as it stands. Do "
             f"not draw a substitute page or screenshot to stand in for it."
         )
     if lower.endswith(_PAGE_SUFFIXES + _IMAGE_SUFFIXES):
         kind = "page" if lower.endswith(_PAGE_SUFFIXES) else "image"
         return (
-            f"Whales: this {kind} was written at `{path}`. If the designer asks "
-            f"Whales to critique it, upload that exact file — "
+            f"whales: this {kind} was written at `{path}`. If the designer asks "
+            f"whales to critique it, upload that exact file — "
             f"`python3 {_UPLOAD_HELPER} upload \"{path}\"` — and pass the "
             f"`source_id` it prints to `universal_critique`. Never retype, "
             f"recreate or screenshot a copy of it."
@@ -894,28 +894,28 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
     default — and only sessions started in ``cwd`` (the project it is run
     from) are sent unless ``all_projects`` is set, so a designer recovering
     one project's capture does not also upload every unrelated session on
-    the machine, including ones from before Whales was installed.
+    the machine, including ones from before whales was installed.
     """
     capture_off = os.environ.get("WHALES_CAPTURE", "").lower() in ("0", "off", "false", "no")
     token = "" if capture_off else _read(TOKEN_FILE)
     if not token:
-        print("Whales backfill: no token at ~/.whales/token (or WHALES_CAPTURE is off); nothing sent.")
+        print("whales backfill: no token at ~/.whales/token (or WHALES_CAPTURE is off); nothing sent.")
         return 0
     if not since:
-        print("Whales backfill: pass --since YYYY-MM-DD (the first day capture was broken); "
+        print("whales backfill: pass --since YYYY-MM-DD (the first day capture was broken); "
               "nothing sent.")
         return 0
     try:
         since_ts = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
-        print(f"Whales backfill: --since must be YYYY-MM-DD, got {since!r}.")
+        print(f"whales backfill: --since must be YYYY-MM-DD, got {since!r}.")
         return 0
 
     url = gateway_url()
     projects_dir = projects_dir or os.path.expanduser("~/.claude/projects")
     search_dir = projects_dir if all_projects else project_transcript_dir(cwd or os.getcwd(), projects_dir)
     if not os.path.isdir(search_dir):
-        print(f"Whales backfill: no Claude Code sessions found for {cwd or os.getcwd()} "
+        print(f"whales backfill: no Claude Code sessions found for {cwd or os.getcwd()} "
               f"(looked in {search_dir}). Run it from the project, or pass --all-projects.")
         return 0
     sessions = chunks = sent_bytes = 0
@@ -944,7 +944,7 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
             if not ok:
                 why = f"token rejected — get a new install command from {new_token_page()}" if status in _AUTH_STATUSES \
                     else (reason or "gateway unreachable")
-                print(f"Whales backfill stopped: {why} (HTTP {status}). "
+                print(f"whales backfill stopped: {why} (HTTP {status}). "
                       f"Sent {chunks} chunk(s) from {sessions} session(s) before stopping; "
                       f"re-run to resume.")
                 return 0
@@ -955,7 +955,7 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
             if not more_pending:
                 break
         sessions += shipped_any
-    print(f"Whales backfill done: {chunks} chunk(s), {sent_bytes // 1024} KB "
+    print(f"whales backfill done: {chunks} chunk(s), {sent_bytes // 1024} KB "
           f"from {sessions} session(s) since {since}.")
     return 0
 
@@ -1025,7 +1025,7 @@ def replace_old_cursor_wrapper() -> None:
 
 
 def restart_notice(session_id: str):
-    """Once per session, when the updater has installed a newer Whales than
+    """Once per session, when the updater has installed a newer whales than
     the one this session loaded: tell the designer (not the model) to restart.
     Only for an installed copy: a --plugin-dir session is meant to differ."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -1050,7 +1050,7 @@ def restart_notice(session_id: str):
             fh.write(f"{session_id} {installed}")
     except OSError:
         return None
-    return {"systemMessage": f"Whales {installed} is installed. Restart Claude Code to use it "
+    return {"systemMessage": f"whales {installed} is installed. Restart Claude Code to use it "
                              f"(this session is on {running})."}
 
 
@@ -1096,7 +1096,7 @@ def main() -> int:
 
     session_id = event.get("session_id") or event.get("conversation_id") or ""
 
-    # Not a capture event: it rewrites a Whales tool call's arguments and
+    # Not a capture event: it rewrites a whales tool call's arguments and
     # ships nothing, so it runs regardless of token or WHALES_CAPTURE — the
     # tool call itself authenticates with the plugin's own credential.
     if args.event == "PreToolUse":
@@ -1144,7 +1144,7 @@ def main() -> int:
             # rejected token is the one failure they have to act on, and the
             # model mentioning it is not guaranteed.
             out["systemMessage"] = (
-                "Whales capture is failing: the gateway rejected this machine's "
+                "whales capture is failing: the gateway rejected this machine's "
                 f"token. Get a new install command from {new_token_page()} and run it."
             )
         print(json.dumps(out))

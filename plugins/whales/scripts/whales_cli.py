@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The `whales` command: see and fix a machine's Whales setup.
+"""The `whales` command: see and fix a machine's whales setup.
 
 Lives at ~/.whales/scripts/whales_cli.py and is started by the small
 ~/.whales/bin/whales launcher. The updater replaces this file with each
@@ -39,10 +39,10 @@ INSTALLER_API = "whales-installer-api: 2"
 HOSTS = ("claude", "cursor")
 
 HELP = """\
-whales — your Whales setup on this machine
+whales — your whales setup on this machine
 
   whales status              what is installed, and whether it is up to date
-  whales update              check for a new Whales now, instead of at the next session
+  whales update              check for a new whales now, instead of at the next session
   whales doctor [--fix]      find (and fix) anything missing or out of date
   whales logs                what the last update did
   whales version             installed versions
@@ -52,7 +52,7 @@ whales — your Whales setup on this machine
                              disconnect one app, or everything when none is named
   whales help                this
 
-Whales updates itself when Claude Code or Cursor starts. Restart them to use a new version.
+whales updates itself when Claude Code or Cursor starts. Restart them to use a new version.
 """
 
 GREEN, YELLOW, RED, DIM, NC = ("\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m") \
@@ -114,7 +114,7 @@ def cmd_status(_args) -> int:
     v = _versions()
     state = up.read_state()
     last = state.get("last_run") or {}
-    print("Whales on this machine\n")
+    print("whales on this machine\n")
     if v["claude_code"]:
         behind = v["published"] and v["published"] != v["claude_code"]
         line = f"Claude Code  plugin {v['claude_code']}"
@@ -158,7 +158,7 @@ def _run_update(force: bool) -> int:
 
 def cmd_update(_args) -> int:
     before = _versions()
-    print("Checking for a new Whales…")
+    print("Checking for a new whales…")
     code = _run_update(force=True)
     after = _versions()
     last = up.read_state().get("last_run") or {}
@@ -166,10 +166,10 @@ def cmd_update(_args) -> int:
         _bad(f"The update did not finish: {last.get('error') or 'see `whales logs`'}")
         return 1
     if after["claude_code"] and after["claude_code"] != before["claude_code"]:
-        _ok(f"Updated Whales from {before['claude_code']} to {after['claude_code']}.")
+        _ok(f"Updated whales from {before['claude_code']} to {after['claude_code']}.")
         print("Restart Claude Code and Cursor to use it.")
     else:
-        _ok(f"Whales is up to date ({after['claude_code'] or after['files']}).")
+        _ok(f"whales is up to date ({after['claude_code'] or after['files']}).")
     return 0
 
 
@@ -182,7 +182,7 @@ def cmd_logs(_args) -> int:
 def _checks() -> list[tuple[bool, str]]:
     v = _versions()
     out: list[tuple[bool, str]] = []
-    out.append((bool(up._read_text(TOKEN_FILE)), "a Whales token is saved in ~/.whales/token"))
+    out.append((bool(up._read_text(TOKEN_FILE)), "a whales token is saved in ~/.whales/token"))
     claude = up.find_claude()
     if claude or v["claude_code"]:
         out.append((bool(v["claude_code"]), "the Claude Code plugin is installed"))
@@ -193,17 +193,17 @@ def _checks() -> list[tuple[bool, str]]:
         allow = set(((settings.get("permissions") or {}).get("allow") or [])) if isinstance(settings, dict) else set()
         if v["claude_code"]:
             missing = [t for t in up.ALLOW_TOOLS if up.ALLOW_PREFIXES[0] + t not in allow]
-            out.append((not missing, "Claude Code won't ask before Whales' read-and-record tools"
+            out.append((not missing, "Claude Code won't ask before whales' read-and-record tools"
                         + (f" (missing: {', '.join(missing)})" if missing else "")))
     if v["cursor"]:
         cfg = up._load_json(up.CURSOR_MCP) or {}
         entry = (cfg.get("mcpServers") or {}).get("whales") if isinstance(cfg, dict) else None
-        out.append((isinstance(entry, dict), "Cursor has the Whales server"))
+        out.append((isinstance(entry, dict), "Cursor has the whales server"))
         out.append((v["cursor_mcp"] == v["files"] and bool(v["files"]),
-                    f"Cursor tells Whales which version it runs ({v['cursor_mcp'] or 'nothing'})"))
-        out.append((up.has_our_cursor_entries(), "Cursor runs Whales' capture hooks"))
+                    f"Cursor tells whales which version it runs ({v['cursor_mcp'] or 'nothing'})"))
+        out.append((up.has_our_cursor_entries(), "Cursor runs whales' capture hooks"))
         out.append((os.path.isfile(up.WRAPPER) and not up.wrapper_outdated(),
-                    "Cursor's Whales hook is the current one"))
+                    "Cursor's whales hook is the current one"))
         out.append((os.path.isfile(up.CAPTURE), "the capture hook is in ~/.whales/scripts"))
     out.append((os.path.isfile(up.HELPER), "the critique upload helper is in ~/.whales/scripts"))
     last = up.read_state().get("last_run") or {}
@@ -240,7 +240,7 @@ def cmd_doctor(args) -> int:
 
 
 def _installer(extra: list[str]) -> int:
-    """Runs the Whales installer with the token already on this machine. It
+    """Runs the whales installer with the token already on this machine. It
     owns host setup (token checks, old Claude Code versions, legacy
     migrations), so it is reused rather than copied here."""
     app = (up._read_text(APP_URL_FILE) or DEFAULT_APP_URL).rstrip("/")
@@ -264,7 +264,7 @@ def cmd_install(args) -> int:
         return 2
     if not up._read_text(TOKEN_FILE):
         app = (up._read_text(APP_URL_FILE) or DEFAULT_APP_URL).rstrip("/")
-        _bad(f"No Whales token on this machine yet. Run the install command from {app}/mcp.")
+        _bad(f"No whales token on this machine yet. Run the install command from {app}/mcp.")
         return 1
     return _installer(["--only", args[0]])
 
@@ -274,7 +274,7 @@ def cmd_uninstall(args) -> int:
         print("Usage: whales uninstall [claude|cursor]")
         return 2
     if not args:
-        print("This disconnects Whales from every app on this machine and deletes its token.")
+        print("This disconnects whales from every app on this machine and deletes its token.")
         try:
             with open("/dev/tty") as tty:
                 sys.stdout.write("Continue? [y/N] ")

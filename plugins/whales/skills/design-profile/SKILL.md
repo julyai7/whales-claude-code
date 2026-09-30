@@ -5,7 +5,7 @@ description: Apply the designer's own established design conventions — their c
 
 # Designing with this designer's own conventions
 
-Whales holds this designer's established conventions, derived from their real
+whales holds this designer's established conventions, derived from their real
 past work — Figma files, live sites, and designs they have already accepted or
 rejected. The point of this skill is that you stop guessing at values they have
 already decided.

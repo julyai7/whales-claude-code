@@ -1,11 +1,11 @@
 ---
 name: design-system
-description: Create, extract, or maintain a design system for a product with Whales, from a Figma file or a live site. Use when the user asks to build/extract/generate a design system, points at a Figma link or website and wants its design system, registers or imports an existing one, updates or maintains one as their designs evolve, or asks what design systems they already have. Triggers on "design system", "design tokens", "style guide", "extract my design system", "maintain my design system", "design system from this Figma file".
+description: Create, extract, or maintain a design system for a product with whales, from a Figma file or a live site. Use when the user asks to build/extract/generate a design system, points at a Figma link or website and wants its design system, registers or imports an existing one, updates or maintains one as their designs evolve, or asks what design systems they already have. Triggers on "design system", "design tokens", "style guide", "extract my design system", "maintain my design system", "design system from this Figma file".
 ---
 
 # Design system extraction & maintenance
 
-Whales either **extracts** a design system from a product's artifacts, or
+whales either **extracts** a design system from a product's artifacts, or
 **registers** one the designer already authored and maintains it from
 there. These are different operations with different tools — routing
 correctly matters more than moving fast.

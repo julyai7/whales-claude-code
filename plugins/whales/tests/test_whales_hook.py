@@ -691,7 +691,7 @@ class TestOffsetOrdering:
 
 
 class TestSessionIdInjection:
-    """The model passed ``client_session_id`` on 4 of 150 Whales calls; the
+    """The model passed ``client_session_id`` on 4 of 150 whales calls; the
     PreToolUse hook sets it instead."""
 
     def _run(self, payload, home, source="claude_code_hook"):
@@ -1034,11 +1034,11 @@ class TestCursorHost:
     # -- sessionStart --------------------------------------------------------
 
     def test_session_start_gives_context_and_env(self):
-        out = wh.cursor_session_start_output("abc", "Whales capture is active.", "cur")
+        out = wh.cursor_session_start_output("abc", "whales capture is active.", "cur")
         assert set(out) == {"additional_context", "env"}
         assert out["env"] == {"WHALES_CLIENT_SESSION_ID": "cur:abc"}
         assert "Cursor session id is `cur:abc`" in out["additional_context"]
-        assert out["additional_context"].startswith("Whales capture is active.")
+        assert out["additional_context"].startswith("whales capture is active.")
 
     # -- postToolUse (DesignContext) ------------------------------------------
 
@@ -1054,7 +1054,7 @@ class TestCursorHost:
 
     def test_a_canvas_is_not_a_critique_source(self):
         text = wh.cursor_design_context({"file_path": "/w/board.canvas.tsx"})
-        assert "not something Whales can critique" in text
+        assert "not something whales can critique" in text
         assert "upload" not in text
 
     def test_other_files_get_no_context(self):
