@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Whales' Cursor hook: ~/.cursor/hooks.json runs this for every event.
+"""whales' Cursor hook: ~/.cursor/hooks.json runs this for every event.
 
-The Whales updater copies it from the plugin's cursor/wrapper.py to
+The whales updater copies it from the plugin's cursor/wrapper.py to
 ~/.whales/scripts/whales_hook.py, the path Cursor's hooks.json has always
 pointed at. It does two things, and must never do a third: block Cursor,
 which is what exit code 2 means to it. So it always exits 0.
 
 1. Runs capture_hook.py (beside this file) with the same arguments and input,
-   so edits made with Cursor's own tools reach Whales.
-2. On a session start, starts the updater, which checks for a new Whales at
+   so edits made with Cursor's own tools reach whales.
+2. On a session start, starts the updater, which checks for a new whales at
    most every few minutes in a detached process. It prefers the updater
    inside the installed Claude Code plugin over the copy beside this file:
    that way a release can fix a broken copy here. Designers without Claude

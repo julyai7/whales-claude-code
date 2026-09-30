@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Move screens between this machine and Whales for `universal_critique`.
+"""Move screens between this machine and whales for `universal_critique`.
 
 A model cannot put image bytes in an MCP tool call, and it should not retype a
 page it already wrote: that is slow, costly, and what arrives is a copy, not
@@ -7,7 +7,7 @@ the file. So the critique tools take a handle instead, and this script is how
 the file itself travels:
 
     critique_source.py upload <path>
-        Sends one screenshot, or one HTML page, to Whales. Prints JSON with
+        Sends one screenshot, or one HTML page, to whales. Prints JSON with
         `source_id` — pass it to `universal_critique`, or to `self_critique`
         for a rebuilt page. For an image it also prints the size and
         `likely_downscaled`. Given Cursor's reduced copy of a pasted
@@ -22,7 +22,7 @@ the file itself travels:
         Downloads the exact image a critique ran on (screen `index` from the
         result's `renders`), for rebuilding from. Prints the saved path.
 
-Credential: `~/.whales/token`, written by the Whales installer — the same file
+Credential: `~/.whales/token`, written by the whales installer — the same file
 the capture hooks read, and for the same reason: it keeps the token out of the
 command line, where it would land in the transcript and in `ps`. The gateway
 is `~/.whales/gateway` if present (the hooks read the same file), else
@@ -83,8 +83,8 @@ def _gateway() -> str:
 def _token() -> str:
     token = _read(TOKEN_FILE)
     if not token:
-        _fail("No Whales token at ~/.whales/token. Re-run the Whales installer from your "
-              "Whales settings page, then try again.")
+        _fail("No whales token at ~/.whales/token. Re-run the whales installer from your "
+              "whales settings page, then try again.")
     return token
 
 
@@ -112,9 +112,9 @@ def _request(req: urllib.request.Request) -> tuple[bytes, str]:
             body = json.loads(body).get("detail", body)
         except ValueError:
             pass
-        _fail(f"Whales refused the request ({exc.code}): {body}")
+        _fail(f"whales refused the request ({exc.code}): {body}")
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        _fail(f"Could not reach Whales at {_gateway()}: {exc}")
+        _fail(f"Could not reach whales at {_gateway()}: {exc}")
     raise AssertionError("unreachable")
 
 
@@ -124,7 +124,7 @@ def _request(req: urllib.request.Request) -> tuple[bytes, str]:
 # Cursor saves a pasted image as a small JPEG — a 1179x2676 PNG arrives as
 # 451x1024 — named "<original name>-<uuid>.jpg", in the project's `assets/`
 # folder (spaces turned to underscores) and in its workspaceStorage (spaces
-# kept). That copy is the only path the agent is given. Whales measures text
+# kept). That copy is the only path the agent is given. whales measures text
 # contrast and icon sizes in pixels, and at that size its numbers are wrong:
 # thin text blurs into its background and every icon falls under the size
 # floor. The original is usually still where the designer took it from, so it
@@ -292,7 +292,7 @@ def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
                 "size": list(size),
                 "note": (f"This is Cursor's reduced copy of a pasted screenshot ({size[0]}x{size[1]}), "
                          f"and {why}. "
-                         "Whales measures text contrast and icon sizes in pixels, and at this size "
+                         "whales measures text contrast and icon sizes in pixels, and at this size "
                          "they come out wrong. Ask the designer to drag the original file in or give "
                          "its path, and upload that instead."),
             }}
@@ -309,12 +309,12 @@ def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 # HTML pages: one self-contained file
 #
-# Whales renders the page on its own server, where the page's neighbouring
+# whales renders the page on its own server, where the page's neighbouring
 # files do not exist: an `<img src="hero.png">` sent as-is renders as a broken
 # image, and the critique then measures a page without its pictures. So every
 # reference to a file on this machine is inlined — images and fonts as data:
 # URIs, stylesheets as <style>, scripts as inline <script> — and internet
-# references are left alone (Whales loads those itself). Nothing is dropped
+# references are left alone (whales loads those itself). Nothing is dropped
 # silently: a local file that cannot be found is reported in `missing`.
 # ---------------------------------------------------------------------------
 
@@ -546,7 +546,7 @@ def upload(path: str, exact: bool = False) -> None:
     except OSError as exc:
         _fail(f"Could not read {path}: {exc}")
     if len(content) > MAX_UPLOAD_BYTES and not path.lower().endswith(_PAGE_SUFFIXES):
-        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB; Whales accepts images up to "
+        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB; whales accepts images up to "
               f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB. Export a smaller copy (a JPEG, or a PNG "
               "under the limit) and upload that.")
     if len(content) > MAX_UPLOAD_BYTES:
@@ -557,7 +557,7 @@ def upload(path: str, exact: bool = False) -> None:
                            reverse=True)[:3]
             biggest = " Largest bundled files: " + ", ".join(
                 f"{name} ({size // 1024} KB)" for size, name in sizes) + "."
-        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB once bundled; Whales "
+        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB once bundled; whales "
               f"accepts up to {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.{biggest}")
     req = urllib.request.Request(
         f"{_gateway()}/critique-sources/",
@@ -590,7 +590,7 @@ def fetch(critique_id: str, index: int, out: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    up = sub.add_parser("upload", help="send a screenshot or an HTML page to Whales")
+    up = sub.add_parser("upload", help="send a screenshot or an HTML page to whales")
     up.add_argument("path")
     up.add_argument("--exact", action="store_true",
                     help="send this file as is, even if it is Cursor's reduced copy of a pasted image")

@@ -1,5 +1,5 @@
 {
-  "description": "Whales capture — observes design work the MCP tools structurally cannot see",
+  "description": "whales capture — observes design work the MCP tools structurally cannot see",
   "hooks": {
     "SessionStart": [
       {

@@ -118,7 +118,7 @@ class TestLeavingTheOldWrapper:
     def old_machine(self, tmp_path) -> Path:
         scripts = tmp_path / ".whales" / "scripts"
         scripts.mkdir(parents=True)
-        (scripts / "whales_hook.py").write_text("#!/usr/bin/env python3\n# Whales' Cursor hook (old)\n")
+        (scripts / "whales_hook.py").write_text("#!/usr/bin/env python3\n# whales' Cursor hook (old)\n")
         shutil.copy(HOOK_SRC, scripts / "capture_hook.py")
         (scripts / "whales_update.py").write_text(STUB_UPDATER.format(python=sys.executable))
         return tmp_path
@@ -185,7 +185,7 @@ class TestRestartNotice:
         running = self._cache(tmp_path, "0.6.0")
         self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
         out = json.loads(self._prompt(tmp_path, running))
-        assert "Whales 0.6.1 is installed. Restart Claude Code" in out["systemMessage"]
+        assert "whales 0.6.1 is installed. Restart Claude Code" in out["systemMessage"]
         assert self._prompt(tmp_path, running) == ""
         assert self._prompt(tmp_path, running, session="s2") != ""
 

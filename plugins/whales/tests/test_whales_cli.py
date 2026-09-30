@@ -67,7 +67,7 @@ def test_update_now(m):
     (m.cfg / "fake.json").write_text(json.dumps(fake))
     r = whales(m, "update")
     assert r.returncode == 0, r.stdout
-    assert "Updated Whales from 0.6.0 to 0.6.1" in r.stdout
+    assert "Updated whales from 0.6.0 to 0.6.1" in r.stdout
     assert "plugin update" in whales(m, "logs").stdout
 
 
@@ -85,18 +85,18 @@ def test_doctor_finds_and_fixes(m):
 def test_doctor_checks_cursor(m):
     _cursor_machine(m)
     r = whales(m, "doctor")
-    assert "✗ Cursor's Whales hook is the current one" in r.stdout
-    assert "✗ Cursor tells Whales which version it runs (nothing)" in r.stdout
+    assert "✗ Cursor's whales hook is the current one" in r.stdout
+    assert "✗ Cursor tells whales which version it runs (nothing)" in r.stdout
     whales(m, "doctor", "--fix")
     r = whales(m, "doctor")
-    assert "✓ Cursor's Whales hook is the current one" in r.stdout
-    assert "✓ Cursor tells Whales which version it runs (0.6.0)" in r.stdout
+    assert "✓ Cursor's whales hook is the current one" in r.stdout
+    assert "✓ Cursor tells whales which version it runs (0.6.0)" in r.stdout
 
 
 def test_install_needs_a_token(m):
     r = whales(m, "install", "cursor")
     assert r.returncode == 1
-    assert "No Whales token" in r.stdout
+    assert "No whales token" in r.stdout
 
 
 def test_install_refuses_an_installer_without_host_support(m, tmp_path):

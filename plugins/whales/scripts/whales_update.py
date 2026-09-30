@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keeps Whales up to date on a designer's machine, so the installer runs once.
+"""Keeps whales up to date on a designer's machine, so the installer runs once.
 
 Two things need updating, and nothing else updates them:
 
@@ -17,9 +17,9 @@ Two things need updating, and nothing else updates them:
      ~/.cursor/hooks.json runs), the capture hook it runs
      (``capture_hook.py``), the critique upload helper both hosts use, this
      updater, and the ``whales`` command.
-   - Whales' entries in ~/.cursor/hooks.json, and the version header in
+   - whales' entries in ~/.cursor/hooks.json, and the version header in
      ~/.cursor/mcp.json.
-   - The allow rules for Whales' read-and-record tools in Claude Code's
+   - The allow rules for whales' read-and-record tools in Claude Code's
      settings.json, so a new tool does not prompt until someone re-installs.
 
    They are copied from the INSTALLED plugin (``installPath`` in
@@ -41,7 +41,7 @@ Modes:
       Only the files outside the plugin, from the given plugin copy. The
       installer's last step.
   --install-cursor-hooks FILE
-      Merge Whales' Cursor hook entries from a plugin cursor/hooks.json file
+      Merge whales' Cursor hook entries from a plugin cursor/hooks.json file
       (the built-in list when it is not a valid one), printing which was used.
 
 Run with no arguments it does nothing and exits 0: Cursor runs Claude Code
@@ -96,7 +96,7 @@ CURSOR_MCP = os.path.join(CURSOR_DIR, "mcp.json")
 PLUGIN_ID = "whales@whales"
 MARKETPLACE = "whales"
 VERSION_HEADER = "X-Whales-Plugin-Version"
-# Allowed without a prompt: Whales' read-and-record tools. Tools that write a
+# Allowed without a prompt: whales' read-and-record tools. Tools that write a
 # design system or run a Figma extraction are left to Claude Code's prompt.
 ALLOW_TOOLS = (
     "whales", "ask_whales", "record_reaction", "get_design_profile",
@@ -124,7 +124,7 @@ BUILTIN_CURSOR_HOOKS = {
 _HOOK_ARGS = re.compile(r'whales_hook\.py"?\s+(--event [A-Za-z]+ --source cursor_hook)\s*$')
 
 LAUNCHER_TEXT = """#!/bin/sh
-# The whales command. Written by the Whales updater; the program is
+# The whales command. Written by the whales updater; the program is
 # ~/.whales/scripts/whales_cli.py, which updates with the plugin.
 exec python3 "$HOME/.whales/scripts/whales_cli.py" "$@"
 """
@@ -172,7 +172,7 @@ def _write_atomic(path: str, data: bytes, mode: int = 0o644) -> None:
 
 def _write_json(path: str, value, backup: bool = False) -> None:
     """Atomic, and with ``backup`` a one-time copy of a file we did not write
-    (never replaced, so it is always the copy from before Whales touched it)."""
+    (never replaced, so it is always the copy from before whales touched it)."""
     if backup and os.path.exists(path) and not os.path.exists(path + ".whales-backup"):
         shutil.copy2(path, path + ".whales-backup")
     mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o644
@@ -207,7 +207,7 @@ def claude_config_dir() -> str:
 
 
 def installed_plugin() -> dict | None:
-    """Whales' user-scope install, read straight from Claude Code's file (the
+    """whales' user-scope install, read straight from Claude Code's file (the
     CLI takes seconds to answer). {"version", "installPath"} or None."""
     data = _load_json(os.path.join(claude_config_dir(), "plugins", "installed_plugins.json"))
     entries = (data or {}).get("plugins", {}).get(PLUGIN_ID) if isinstance(data, dict) else None
@@ -318,7 +318,7 @@ def make_source(spec: str):
 # --------------------------------------------------------------------------
 
 def cursor_wired() -> bool:
-    """Whether this machine has Whales in Cursor at all: our wrapper, or our
+    """Whether this machine has whales in Cursor at all: our wrapper, or our
     server in Cursor's MCP config."""
     if os.path.exists(WRAPPER):
         return True
@@ -339,10 +339,10 @@ def _install_script(source, rel: str, dest: str) -> None:
 
 
 def our_cursor_entries(spec) -> dict | None:
-    """Whales' ~/.cursor/hooks.json entries from a plugin hooks file, or None
+    """whales' ~/.cursor/hooks.json entries from a plugin hooks file, or None
     if it is not one. Only each entry's event, --event/--source, matcher and
     timeout come from the file. The command is rebuilt around the wrapper's
-    absolute path: that path is how Whales' entries are told apart from
+    absolute path: that path is how whales' entries are told apart from
     everyone else's (here, on uninstall, and by the legacy-hook migration)."""
     hooks = spec.get("hooks") if isinstance(spec, dict) else None
     if not isinstance(hooks, dict) or not hooks:
@@ -372,7 +372,7 @@ def has_our_cursor_entries() -> bool:
 
 
 def merge_cursor_hooks(entries: dict) -> None:
-    """Replace Whales' entries in ~/.cursor/hooks.json with ``entries`` in
+    """Replace whales' entries in ~/.cursor/hooks.json with ``entries`` in
     every event, and leave everyone else's exactly as they are. A file that is
     there but cannot be read is left alone (raises) rather than replaced."""
     try:
@@ -420,7 +420,7 @@ def install_cursor_hooks(spec_path: str) -> int:
 
 def set_cursor_version_header(version: str) -> bool:
     """Cursor's MCP entry, written once by the installer, never said which
-    Whales it runs. Updates only an entry that is there."""
+    whales it runs. Updates only an entry that is there."""
     cfg = _load_json(CURSOR_MCP)
     entry = cfg.get("mcpServers", {}).get("whales") if isinstance(cfg, dict) else None
     if not isinstance(entry, dict):
@@ -436,7 +436,7 @@ def set_cursor_version_header(version: str) -> bool:
 
 
 def allow_whales_tools() -> int:
-    """Adds allow rules for Whales' read-and-record tools to Claude Code's
+    """Adds allow rules for whales' read-and-record tools to Claude Code's
     user settings. The same guards as the installer: only next to our
     marketplace entry, add only, and a tool the designer put under deny or
     ask is theirs."""
@@ -500,12 +500,12 @@ def sync(source, version: str, enable_cursor_hooks: bool = False) -> bool:
 
     if cursor and (enable_cursor_hooks or has_our_cursor_entries()):
         # Only entries that are already there (or asked for): a designer who
-        # removed Whales' Cursor hooks keeps them removed.
+        # removed whales' Cursor hooks keeps them removed.
         try:
             spec = json.loads(source.read("cursor/hooks.json"))
             entries = our_cursor_entries(spec)
             if entries is None:
-                raise ValueError("not a Whales Cursor hooks file")
+                raise ValueError("not a whales Cursor hooks file")
         except Exception as exc:  # noqa: BLE001
             log(f"using the built-in Cursor hook list: {exc}")
             entries = our_cursor_entries({"hooks": BUILTIN_CURSOR_HOOKS})
@@ -564,7 +564,7 @@ def release_lock() -> None:
 
 def run(host: str, force: bool = False) -> int:
     if not acquire_lock():
-        log("another Whales update is already running")
+        log("another whales update is already running")
         return 0
     started = time.time()
     write_state(last_check=started)
