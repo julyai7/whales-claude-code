@@ -65,6 +65,9 @@ OFFSET_DIR = os.path.join(CONFIG_DIR, "offsets")
 # still accepts it — a designer once saw "capture is active" for four weeks
 # while every upload was being rejected.
 STATUS_FILE = os.path.join(CONFIG_DIR, "capture_status.json")
+# The web app this machine was installed from, written by the installer
+# (0.6.0+). Where a rejected token sends the designer for a new one.
+APP_URL_FILE = os.path.join(CONFIG_DIR, "app_url")
 
 DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
 
@@ -207,6 +210,14 @@ def _read(path: str) -> str:
             return fh.read().strip()
     except OSError:
         return ""
+
+
+def new_token_page() -> str:
+    """Where to get a fresh install command: the web app's MCP page. Named
+    generically when the installer predates ``app_url``, rather than guessing
+    prod for a staging machine."""
+    app = _read(APP_URL_FILE).rstrip("/")
+    return f"{app}/mcp" if app else "the Connect MCP page in Whales"
 
 
 def gateway_url() -> str:
@@ -672,7 +683,8 @@ def _capture_lead(state: str, status: dict) -> str:
             f"rejected its token since {status.get('first_failed_at')}, so "
             f"{status.get('failed_since_ok')} capture event(s) were not recorded. "
             f"Tell the designer once, briefly, that Whales capture needs its "
-            f"token refreshed by re-running the Whales installer."
+            f"token refreshed: get a new install command from {new_token_page()} "
+            f"and run it."
         )
     if state == "failing":
         reason = (status.get("last_error") or {}).get("reason") or "unreachable"
@@ -930,7 +942,7 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
             ok, status, reason = _send(url, token, body)
             record_send_result(ok, status, reason)
             if not ok:
-                why = "token rejected — re-run the Whales installer" if status in _AUTH_STATUSES \
+                why = f"token rejected — get a new install command from {new_token_page()}" if status in _AUTH_STATUSES \
                     else (reason or "gateway unreachable")
                 print(f"Whales backfill stopped: {why} (HTTP {status}). "
                       f"Sent {chunks} chunk(s) from {sessions} session(s) before stopping; "
@@ -1133,7 +1145,7 @@ def main() -> int:
             # model mentioning it is not guaranteed.
             out["systemMessage"] = (
                 "Whales capture is failing: the gateway rejected this machine's "
-                "token. Re-run the Whales installer to refresh it."
+                f"token. Get a new install command from {new_token_page()} and run it."
             )
         print(json.dumps(out))
     if args.event == "UserPromptSubmit" and args.source == "claude_code_hook":

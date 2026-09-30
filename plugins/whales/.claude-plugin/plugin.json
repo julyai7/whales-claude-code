@@ -21,7 +21,7 @@
     "whales_token": {
       "type": "string",
       "title": "Whales agent token",
-      "description": "From your Whales settings page. The installer sets this for you.",
+      "description": "From the Connect MCP page (/mcp) in Whales. The installer sets this for you.",
       "sensitive": true
     }
   }

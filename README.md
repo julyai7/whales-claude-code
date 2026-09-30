@@ -16,7 +16,7 @@ claude plugin marketplace add julyai7/whales-claude-code
 claude plugin install whales@whales --config whales_token=<your token>
 ```
 
-Get a token from your Whales settings page. `--yes` is required when stdin
+Get a token from the Connect MCP page (`/mcp`) in the Whales web app. `--yes` is required when stdin
 isn't a TTY, which is the case inside `curl | bash`.
 
 ## What's in it

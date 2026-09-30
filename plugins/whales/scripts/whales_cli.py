@@ -263,7 +263,8 @@ def cmd_install(args) -> int:
         print("Usage: whales install claude|cursor")
         return 2
     if not up._read_text(TOKEN_FILE):
-        _bad("No Whales token on this machine yet. Run the install command from your Whales settings page.")
+        app = (up._read_text(APP_URL_FILE) or DEFAULT_APP_URL).rstrip("/")
+        _bad(f"No Whales token on this machine yet. Run the install command from {app}/mcp.")
         return 1
     return _installer(["--only", args[0]])
 

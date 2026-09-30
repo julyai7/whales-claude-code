@@ -83,8 +83,8 @@ def _gateway() -> str:
 def _token() -> str:
     token = _read(TOKEN_FILE)
     if not token:
-        _fail("No Whales token at ~/.whales/token. Re-run the Whales installer from your "
-              "Whales settings page, then try again.")
+        _fail("No Whales token at ~/.whales/token. Run the install command from the "
+              "Connect MCP page in Whales (/mcp), then try again.")
     return token
 
 

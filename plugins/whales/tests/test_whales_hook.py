@@ -240,7 +240,26 @@ class TestProcessBehaviour:
         ctx = out["hookSpecificOutput"]["additionalContext"]
         assert "capture is active" not in ctx
         assert "rejected" in ctx and "2026-08-27T16:10:00Z" in ctx and "412" in ctx
-        assert "installer" in out["systemMessage"], "the designer must see it, not only the model"
+        assert "install command" in out["systemMessage"], "the designer must see it, not only the model"
+
+    def test_a_rejected_token_names_the_mcp_page_it_was_installed_from(self, tmp_path):
+        rejected = {"failed_since_ok": 3, "first_failed_at": "2026-09-29T10:00:00Z",
+                    "last_error": {"status": 401}}
+        # An installer older than app_url: named generically, never guessed.
+        old = tmp_path / "old"
+        old.mkdir()
+        self._configured(old, rejected)
+        out = self._session_start(old)
+        assert "Connect MCP page" in out["systemMessage"]
+        assert "/settings" not in out["systemMessage"]
+
+        new = tmp_path / "new"
+        new.mkdir()
+        self._configured(new, rejected)
+        (new / ".whales" / "app_url").write_text("https://whales-staging.gojuly.ai\n")
+        out = self._session_start(new)
+        assert "https://whales-staging.gojuly.ai/mcp" in out["systemMessage"]
+        assert "https://whales-staging.gojuly.ai/mcp" in out["hookSpecificOutput"]["additionalContext"]
 
     def test_an_unreachable_gateway_is_failing_but_asks_nothing_of_the_designer(self, tmp_path):
         self._configured(tmp_path, {
