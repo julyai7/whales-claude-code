@@ -1,6 +1,6 @@
 ---
 name: universal-critique
-description: Have whales critique a screen the designer shares — a screenshot (pasted or dragged in), an HTML page, a live web page, or a Figma file — the same critique the whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is whales critiquing THEIR screen; recording the designer's own feedback on a design is `record_critique`, a different thing.
+description: Have whales critique a screen the designer shares — a screenshot (pasted or dragged in), an HTML page, a live web page, or a Figma file — the same critique the whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is whales critiquing THEIR screen; recording how the designer reacts to it is `record_critique` with the critique's id, a different thing.
 ---
 
 # Universal critique
@@ -89,6 +89,19 @@ faithfully, keeping its table as a table, without adding scores or jargon.
 Then follow `next_step`: offer, in one line, to generate an updated version.
 **Do not generate unless they ask.**
 
+When the designer reacts to the critique, record it against **this critique**:
+
+- They agree with, reject or qualify a finding ("👎 the contrast looks fine",
+  "1 is right but 3 doesn't matter here") → `record_critique` with their words
+  exactly, the `critique_id`, and `finding_ref` (the row number, "A1" for an
+  "Also noticed" item) when it is about one finding.
+- They accept the critique, or the rebuild made from it → `record_approval`
+  with the `critique_id`, and `finding_refs` if they accepted only some.
+
+Their own decisions about how the product should work, and plans or lists of
+proposed changes, are not reactions to the critique: don't record them with
+either tool.
+
 ## 4. Generate — only when asked
 
 1. Call `get_rebuild_contract` with surface `host-agent` and this critique's
@@ -123,9 +136,16 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
    the `screen` index you rebuilt. Fix every violation it reports, save,
    upload again and call it again: at most three rounds. A page that has
    never passed it is not finished; say what is still open.
-7. In that same turn, show the designer the rendered screen: open the PNG of
-   the page. On Cursor, open the PNG, not the HTML file — that opens its
-   source, and it reads as if nothing was generated.
+7. In that same turn, show the designer the critiqued screen and the rebuild
+   side by side. Pass the file you rebuilt from in step 2 as the before — the
+   real original, never a stand-in — and the rebuilt file as the after:
+   ```bash
+   python3 critique_source.py compare "<before>" "<rebuilt file>"
+   ```
+   Open the `png` it prints. On Cursor, open the PNG, not the HTML file — that
+   opens its source, and it reads as if nothing was generated. If `png` is
+   null (no Chrome-family browser was found), open the PNG of the rebuilt
+   page instead and give the comparison's `html` path.
 
 ## Other results
 

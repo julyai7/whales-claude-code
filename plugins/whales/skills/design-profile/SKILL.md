@@ -60,13 +60,18 @@ Re-submitting a revision for the same product is also how the system learns:
 the diff against your previous submission becomes a real signal about what they
 actually changed, with no extra step from anyone.
 
-## When they react to a design
+## When they react to a design you built
+
+This is for a design you built and submitted with `submit_design` in this
+session. A reaction to a whales critique goes with that critique's
+`critique_id` instead (see the universal-critique skill).
 
 - They give feedback, however brief → `record_critique` with **their words**,
   not your paraphrase. "Too heavy" is the signal; "the user requested reduced
   visual weight" is your interpretation of the signal, and the interpretation
   is what the classifier is for.
-- They accept it as-is → `record_approval`.
+- They accept it as-is → `record_approval`. Not for a plan or proposal, only
+  for a design they have seen built.
 
 Both are quick and both matter more than they look: an approval is the only
 positive evidence in the system. Without it, every convention is inferred from
