@@ -314,11 +314,10 @@ def test_the_upload_sends_the_original_and_names_it(monkeypatch, cursor_paste, c
 
 import html as html_lib
 import re
-import struct
 import zlib
 
 
-def _png(width, height):
+def _decodable_png(width, height):
     """A real, decodable one-colour PNG, so a browser can lay it out too."""
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
@@ -329,7 +328,7 @@ def _png(width, height):
 
 def test_a_page_beside_a_portrait_screenshot_is_laid_out_at_phone_width(tmp_path):
     shot = tmp_path / "shot.png"
-    shot.write_bytes(_png(10, 20))
+    shot.write_bytes(_decodable_png(10, 20))
     page = _page(tmp_path, '<img src="hero.png">', {"hero.png": PNG})
     out, missing = critique_source.compare_page(str(shot), page)
     assert 'data-width="390"' in out
@@ -342,7 +341,7 @@ def test_a_page_beside_a_portrait_screenshot_is_laid_out_at_phone_width(tmp_path
 
 def test_a_landscape_screenshot_makes_the_page_a_desktop_one(tmp_path):
     shot = tmp_path / "shot.png"
-    shot.write_bytes(_png(30, 20))
+    shot.write_bytes(_decodable_png(30, 20))
     page = _page(tmp_path, "<p>hi</p>")
     assert 'data-width="1440"' in critique_source.compare_page(str(shot), page)[0]
     assert 'data-width="800"' in critique_source.compare_page(str(shot), page, width=800)[0]
@@ -364,7 +363,7 @@ def test_a_file_that_is_neither_image_nor_page_is_refused(tmp_path, capsys):
 def test_without_a_browser_the_html_is_still_written(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(critique_source, "_browser", lambda: None)
     before = tmp_path / "before.png"
-    before.write_bytes(_png(10, 20))
+    before.write_bytes(_decodable_png(10, 20))
     after = _page(tmp_path, "<p>after</p>")
     critique_source.compare(str(before), after, None, None)
     result = json.loads(capsys.readouterr().out)
@@ -381,7 +380,7 @@ def test_an_unknown_browser_override_is_not_used(monkeypatch):
 @pytest.mark.skipif(critique_source._browser() is None, reason="no Chrome-family browser here")
 def test_the_png_is_both_panels_at_one_height(tmp_path, capsys):
     before = tmp_path / "before.png"
-    before.write_bytes(_png(200, 400))
+    before.write_bytes(_decodable_png(200, 400))
     after = _page(tmp_path, '<body style="margin:0"><div style="height:800px;background:#08f"></div></body>')
     critique_source.compare(str(before), after, None, None)
     result = json.loads(capsys.readouterr().out)
