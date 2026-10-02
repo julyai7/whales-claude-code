@@ -646,8 +646,10 @@ window.addEventListener("load", () => {
     el.style.height = target + "px";
     if (el.tagName !== "IMG") el.querySelector("iframe").style.transform = "scale(" + s + ")";
   });
-  const page = document.documentElement;
-  document.body.setAttribute("data-whales-size", page.scrollWidth + "x" + page.scrollHeight);
+  // The content's own box, not the document's: the document is at least the
+  // probe window (1600 wide), which left empty space right of and below the pair.
+  const box = document.body.getBoundingClientRect();
+  document.body.setAttribute("data-whales-size", Math.ceil(box.right) + "x" + Math.ceil(box.bottom));
 });
 """ % _MAX_COMPARE_HEIGHT
 
