@@ -1,27 +1,27 @@
 ---
 name: universal-critique
-description: Have Whales critique a screen the designer shares — a screenshot (pasted or dragged in), an HTML page, a live web page, or a Figma file — the same critique the Whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is Whales critiquing THEIR screen; recording the designer's own feedback on a design is `record_critique`, a different thing.
+description: Have whales critique a screen the designer shares — a screenshot (pasted or dragged in), an HTML page, a live web page, or a Figma file — the same critique the whales web app gives. Use when the designer asks for a critique, review or feedback on a screen or design ("critique this", "what's wrong with this page", "review my Figma file", "give me feedback on this screenshot"). This is whales critiquing THEIR screen; recording the designer's own feedback on a design is `record_critique`, a different thing.
 ---
 
 # Universal critique
 
-Whales critiques a screen in three steps, and you run them with the
+whales critiques a screen in three steps, and you run them with the
 `universal_critique` tool: it settles what the screen is FOR, critiques it
 against that, and then — only if the designer asks — you generate an updated
 version and check it with `self_critique`. Pass `client_session_id` on every
 call.
 
-**The rule behind every step: Whales gets the real file.** Upload the file the
+**The rule behind every step: whales gets the real file.** Upload the file the
 designer has or you wrote. Never retype a page into a tool call, never
 recreate a screen to stand in for it, and never screenshot a copy.
 
 The upload script is `critique_source.py`:
 - in Claude Code, beside this skill: `"<this skill's base directory>/critique_source.py"`;
-- anywhere else (Cursor), where the Whales installer put it: `~/.whales/scripts/critique_source.py`.
+- anywhere else (Cursor), where the whales installer put it: `~/.whales/scripts/critique_source.py`.
 
 Below, `critique_source.py` means whichever of those applies.
 
-## 1. Get the screen to Whales
+## 1. Get the screen to whales
 
 **An image or an HTML page on disk** — upload that file:
 
@@ -33,8 +33,8 @@ It prints JSON with a `source_id`. Call `universal_critique` with that
 `source_id` (and `filename`).
 
 - **An HTML page** is sent with everything it loads from this machine —
-  images, stylesheets, scripts, fonts — bundled into the one file, so Whales
-  sees it as it renders here. Internet links are left for Whales to load.
+  images, stylesheets, scripts, fonts — bundled into the one file, so whales
+  sees it as it renders here. Internet links are left for whales to load.
   If the result lists anything under `missing`, tell the designer those
   files were not found, once; the critique still runs.
 - **HTML the designer pasted** — save it to a file once, exactly as pasted,
@@ -56,7 +56,8 @@ It prints JSON with a `source_id`. Call `universal_critique` with that
   designer for it (drag it in or give its path) before calling
   `universal_critique`, because at that size the contrast and size
   measurements come out wrong. If they have no original, upload with
-  `--exact` and say the pixel measurements may be off.
+  `--exact` and say the pixel measurements may be off. If it has
+  `original_too_large`, the reduced copy was sent: pass on its note once.
 - **Any upload that comes back `low_resolution`** — mention once that the
   original file would give a more accurate critique. Don't block on it.
 - **A Cursor canvas** has no image file, so it cannot be critiqued as it
@@ -69,12 +70,12 @@ file.
 ## 2. Settle the goal
 
 The first result is `status: "awaiting_goal"`. Follow its `instructions`: say
-in a sentence or two what Whales reads the screen as, and ask what it is
+in a sentence or two what whales reads the screen as, and ask what it is
 actually for. **Do not critique it yourself while you wait**, even though you
 can see it.
 
 When they answer, call `universal_critique` with the `critique_id` and
-`reply` set to **their words, exactly as written** — Whales reads the reply
+`reply` set to **their words, exactly as written** — whales reads the reply
 against its own reading, so a paraphrase loses what they meant.
 
 If the designer said what the screen is for in the same message as the
@@ -92,14 +93,16 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 1. Call `get_rebuild_contract` with surface `host-agent` and this critique's
    `critique_id`, before writing anything, and follow it. The id is how the
-   layout Whales already measured is included. Whales' critique is the only
+   layout whales already measured is included. whales' critique is the only
    analysis: don't run measurements of your own to overrule a finding. If one
    looks wrong, ask the designer before building it, marked "My read, not
-   Whales'", and do what they decide.
+   whales'", and do what they decide.
 2. Rebuild from the critiqued screen itself:
    - an HTML page → start from a copy of the designer's own file (never a
      recreation of it);
-   - a screenshot → the file the designer gave you;
+   - a screenshot → the file that was uploaded: `original.path` if the upload
+     reported an `original`, otherwise the file the designer gave you. whales'
+     measurements are in that file's pixels;
    - a web page, Figma file or HTML page with `renders` → the exact images
      that were critiqued, one per entry in `renders`:
      ```bash
@@ -135,6 +138,6 @@ Then follow `next_step`: offer, in one line, to generate an updated version.
 
 - `empty` — the source had no screens (a component library, a moodboard). Say
   what it holds, from `source_summary`.
-- `failed` — say so plainly. Any read of your own is yours, not Whales'.
+- `failed` — say so plainly. Any read of your own is yours, not whales'.
 - `not_enabled` — critique is off for this account; say so.
 - An upload error — relay it. A missing token means re-running the installer.

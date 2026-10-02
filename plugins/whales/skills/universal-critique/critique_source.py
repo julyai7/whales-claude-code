@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Move screens between this machine and Whales for `universal_critique`.
+"""Move screens between this machine and whales for `universal_critique`.
 
 A model cannot put image bytes in an MCP tool call, and it should not retype a
 page it already wrote: that is slow, costly, and what arrives is a copy, not
@@ -7,7 +7,7 @@ the file. So the critique tools take a handle instead, and this script is how
 the file itself travels:
 
     critique_source.py upload <path>
-        Sends one screenshot, or one HTML page, to Whales. Prints JSON with
+        Sends one screenshot, or one HTML page, to whales. Prints JSON with
         `source_id` — pass it to `universal_critique`, or to `self_critique`
         for a rebuilt page. For an image it also prints the size and
         `likely_downscaled`. Given Cursor's reduced copy of a pasted
@@ -28,7 +28,7 @@ the file itself travels:
         AFTER unless --out) and, when a Chrome-family browser is installed, a
         PNG of it. Prints both paths; `png` is null when none could be made.
 
-Credential: `~/.whales/token`, written by the Whales installer — the same file
+Credential: `~/.whales/token`, written by the whales installer — the same file
 the capture hooks read, and for the same reason: it keeps the token out of the
 command line, where it would land in the transcript and in `ps`. The gateway
 is `~/.whales/gateway` if present (the hooks read the same file), else
@@ -93,8 +93,8 @@ def _gateway() -> str:
 def _token() -> str:
     token = _read(TOKEN_FILE)
     if not token:
-        _fail("No Whales token at ~/.whales/token. Re-run the Whales installer from your "
-              "Whales settings page, then try again.")
+        _fail("No whales token at ~/.whales/token. Run the install command from the "
+              "Connect MCP page in whales (/mcp), then try again.")
     return token
 
 
@@ -122,9 +122,9 @@ def _request(req: urllib.request.Request) -> tuple[bytes, str]:
             body = json.loads(body).get("detail", body)
         except ValueError:
             pass
-        _fail(f"Whales refused the request ({exc.code}): {body}")
+        _fail(f"whales refused the request ({exc.code}): {body}")
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        _fail(f"Could not reach Whales at {_gateway()}: {exc}")
+        _fail(f"Could not reach whales at {_gateway()}: {exc}")
     raise AssertionError("unreachable")
 
 
@@ -134,7 +134,7 @@ def _request(req: urllib.request.Request) -> tuple[bytes, str]:
 # Cursor saves a pasted image as a small JPEG — a 1179x2676 PNG arrives as
 # 451x1024 — named "<original name>-<uuid>.jpg", in the project's `assets/`
 # folder (spaces turned to underscores) and in its workspaceStorage (spaces
-# kept). That copy is the only path the agent is given. Whales measures text
+# kept). That copy is the only path the agent is given. whales measures text
 # contrast and icon sizes in pixels, and at that size its numbers are wrong:
 # thin text blurs into its background and every icon falls under the size
 # floor. The original is usually still where the designer took it from, so it
@@ -151,10 +151,30 @@ _SEARCH_DEPTH = 2
 # A phone screenshot narrower than this has lost most of its pixels (an iPhone
 # screenshot is 1080-1320 wide); the critique still runs, with a warning.
 _LOW_RES_WIDTH = 750
+# Cursor's copies seen so far are 1024px on their long edge. A Cursor file larger
+# than that was not shrunk, so there is nothing to warn about.
+_CURSOR_MAX_EDGE = 1024
+# The copy is made from the original, so the original already existed when it
+# was: a same-named file saved later is a different image. Slack for clock and
+# filesystem timestamp rounding.
+_MTIME_SLACK_SECONDS = 120
+# Names too generic to identify one image by: a clipboard paste Cursor calls
+# "image-<uuid>" would otherwise match any image.png in Downloads.
+_GENERIC_STEM = re.compile(
+    r"^(image|img|screenshot|screen shot|untitled|photo|picture|pasted image|clipboard)"
+    r"( ?\(?\d+\)?)?$")
+# Enough of a file to find its dimensions, even past a large EXIF block.
+_HEADER_BYTES = 1024 * 1024
 
 
 def _dimensions(content: bytes) -> tuple[int, int] | None:
     """Width and height from an image's header, for PNG, JPEG, GIF and WebP."""
+    size = _header_dimensions(content)
+    # A truncated or malformed header can read as a zero side.
+    return size if size and size[0] > 0 and size[1] > 0 else None
+
+
+def _header_dimensions(content: bytes) -> tuple[int, int] | None:
     if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
         return int.from_bytes(content[16:20], "big"), int.from_bytes(content[20:24], "big")
     if content[:6] in (b"GIF87a", b"GIF89a") and len(content) >= 10:
@@ -194,7 +214,7 @@ def _dimensions(content: bytes) -> tuple[int, int] | None:
 def _file_dimensions(path: str) -> tuple[int, int] | None:
     try:
         with open(path, "rb") as fh:
-            return _dimensions(fh.read())
+            return _dimensions(fh.read(_HEADER_BYTES))
     except OSError:
         return None
 
@@ -205,11 +225,23 @@ def _name_key(name: str) -> str:
 
 def _cursor_copy_stem(path: str) -> str | None:
     """The original file's name if `path` is Cursor's copy of a pasted image."""
-    full = os.path.abspath(path)
-    if not any(a in full and b in full for a, b in _CURSOR_COPY_DIRS):
+    full = os.path.abspath(path).replace("\\", "/")
+    if not any(_in_order(full, a, b) for a, b in _CURSOR_COPY_DIRS):
         return None
     match = _UUID_SUFFIX.match(os.path.splitext(os.path.basename(full))[0])
     return match.group("stem") if match else None
+
+
+def _in_order(path: str, first: str, then: str) -> bool:
+    at = path.find(first)
+    return at >= 0 and path.find(then, at + len(first)) >= 0
+
+
+def _mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
 
 
 def _candidates(stem: str):
@@ -227,8 +259,10 @@ def _candidates(stem: str):
                     yield os.path.join(root, name)
 
 
-def _find_original(stem: str, reduced: tuple[int, int]) -> tuple[str, tuple[int, int]] | None:
-    """The largest same-named image with the copy's shape and more pixels."""
+def _find_original(stem: str, reduced: tuple[int, int],
+                   copied_at: float | None = None) -> tuple[str, tuple[int, int]] | None:
+    """The same-named image with the copy's shape and more pixels that existed
+    when the copy was made; the most recent one if there are several."""
     ratio = reduced[0] / reduced[1]
     best = None
     for path in _candidates(stem):
@@ -238,9 +272,12 @@ def _find_original(stem: str, reduced: tuple[int, int]) -> tuple[str, tuple[int,
         # The same screen has the same shape, within the resize's rounding.
         if abs(size[0] / size[1] - ratio) > 0.02 * ratio:
             continue
-        if best is None or size[0] > best[1][0]:
-            best = (path, size)
-    return best
+        saved_at = _mtime(path) or 0.0
+        if copied_at is not None and saved_at > copied_at + _MTIME_SLACK_SECONDS:
+            continue
+        if best is None or (saved_at, size[0]) > (best[2], best[1][0]):
+            best = (path, size, saved_at)
+    return best[:2] if best else None
 
 
 def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
@@ -250,21 +287,25 @@ def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
         return path, {}
     stem = None if exact else _cursor_copy_stem(path)
     if stem:
-        found = _find_original(stem, size)
+        generic = bool(_GENERIC_STEM.match(_name_key(stem)))
+        found = None if generic else _find_original(stem, size, _mtime(path))
         if found:
             original, original_size = found
             return original, {"original": {
                 "path": original, "size": list(original_size),
                 "instead_of": path, "reduced_size": list(size),
             }}
-        return path, {"reduced_copy": {
-            "size": list(size),
-            "note": (f"This is Cursor's reduced copy of a pasted screenshot ({size[0]}x{size[1]}), "
-                     f"and no original named \"{stem}\" was found in {', '.join(SEARCH_DIRS)}. "
-                     "Whales measures text contrast and icon sizes in pixels, and at this size "
-                     "they come out wrong. Ask the designer to drag the original file in or give "
-                     "its path, and upload that instead."),
-        }}
+        if max(size) <= _CURSOR_MAX_EDGE:
+            why = (f"its name (\"{stem}\") is too generic to find the original by" if generic
+                   else f"no original named \"{stem}\" was found in {', '.join(SEARCH_DIRS)}")
+            return path, {"reduced_copy": {
+                "size": list(size),
+                "note": (f"This is Cursor's reduced copy of a pasted screenshot ({size[0]}x{size[1]}), "
+                         f"and {why}. "
+                         "whales measures text contrast and icon sizes in pixels, and at this size "
+                         "they come out wrong. Ask the designer to drag the original file in or give "
+                         "its path, and upload that instead."),
+            }}
     if size[0] < _LOW_RES_WIDTH and size[1] > size[0] * 1.5:
         return path, {"low_resolution": {
             "size": list(size),
@@ -278,12 +319,12 @@ def _pick_image(path: str, exact: bool) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 # HTML pages: one self-contained file
 #
-# Whales renders the page on its own server, where the page's neighbouring
+# whales renders the page on its own server, where the page's neighbouring
 # files do not exist: an `<img src="hero.png">` sent as-is renders as a broken
 # image, and the critique then measures a page without its pictures. So every
 # reference to a file on this machine is inlined — images and fonts as data:
 # URIs, stylesheets as <style>, scripts as inline <script> — and internet
-# references are left alone (Whales loads those itself). Nothing is dropped
+# references are left alone (whales loads those itself). Nothing is dropped
 # silently: a local file that cannot be found is reported in `missing`.
 # ---------------------------------------------------------------------------
 
@@ -497,9 +538,27 @@ def upload(path: str, exact: bool = False) -> None:
             path, report = _pick_image(path, exact)
             with open(path, "rb") as fh:
                 content = fh.read()
+            if len(content) > MAX_UPLOAD_BYTES and "original" in report:
+                # The copy uploaded fine before the swap; don't make the swap the reason it fails.
+                original = report.pop("original")
+                path = original["instead_of"]
+                with open(path, "rb") as fh:
+                    content = fh.read()
+                report["original_too_large"] = {
+                    "path": original["path"], "size": original["size"],
+                    "note": (f"The original ({original['path']}) is over "
+                             f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB, so Cursor's reduced copy was "
+                             "sent instead. Tell the designer the text contrast and icon size "
+                             "measurements may be off, and that a smaller export of the original "
+                             "(a JPEG, or a PNG under the limit) would fix it."),
+                }
             media = _media_type(content, path)
     except OSError as exc:
         _fail(f"Could not read {path}: {exc}")
+    if len(content) > MAX_UPLOAD_BYTES and not path.lower().endswith(_PAGE_SUFFIXES):
+        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB; whales accepts images up to "
+              f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB. Export a smaller copy (a JPEG, or a PNG "
+              "under the limit) and upload that.")
     if len(content) > MAX_UPLOAD_BYTES:
         biggest = ""
         if report.get("bundled"):
@@ -508,7 +567,7 @@ def upload(path: str, exact: bool = False) -> None:
                            reverse=True)[:3]
             biggest = " Largest bundled files: " + ", ".join(
                 f"{name} ({size // 1024} KB)" for size, name in sizes) + "."
-        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB once bundled; Whales "
+        _fail(f"{os.path.basename(path)} is {len(content) // 1024} KB once bundled; whales "
               f"accepts up to {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.{biggest}")
     req = urllib.request.Request(
         f"{_gateway()}/critique-sources/",
@@ -705,7 +764,7 @@ def compare(before: str, after: str, out: str | None, width: int | None) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    up = sub.add_parser("upload", help="send a screenshot or an HTML page to Whales")
+    up = sub.add_parser("upload", help="send a screenshot or an HTML page to whales")
     up.add_argument("path")
     up.add_argument("--exact", action="store_true",
                     help="send this file as is, even if it is Cursor's reduced copy of a pasted image")

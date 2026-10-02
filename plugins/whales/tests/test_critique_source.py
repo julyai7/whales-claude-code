@@ -202,6 +202,7 @@ def test_an_image_upload_is_unchanged(monkeypatch, tmp_path, config, capsys):
 # Screenshots: the original, not Cursor's reduced copy
 # ---------------------------------------------------------------------------
 
+import os
 import struct
 
 UUID = "28a9df01-317b-47da-aa49-1036568cb657"
@@ -387,3 +388,96 @@ def test_the_png_is_both_panels_at_one_height(tmp_path, capsys):
     size = critique_source._file_dimensions(result["png"])
     # Both panels scaled to the taller one (800), side by side, plus captions and padding.
     assert size[1] > 800 and size[0] > 2 * 200
+
+
+def test_a_zero_sided_header_is_not_an_image():
+    assert critique_source._dimensions(_png(100, 0)) is None
+    assert critique_source._dimensions(b"GIF89a" + struct.pack("<HH", 0, 40)) is None
+
+
+def test_a_corrupt_same_named_candidate_is_skipped_not_a_crash(cursor_paste):
+    copy, downloads = cursor_paste
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 0))
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(copy) and "reduced_copy" in report
+
+
+def test_a_generic_name_is_never_matched(monkeypatch, tmp_path):
+    """A clipboard paste Cursor calls image-<uuid> must not pick up any image.png."""
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    (downloads / "image.png").write_bytes(_png(1179, 2676))
+    monkeypatch.setattr(critique_source, "SEARCH_DIRS", (str(downloads),))
+    assets = tmp_path / ".cursor" / "projects" / "p" / "assets"
+    assets.mkdir(parents=True)
+    copy = assets / f"image-{UUID}.jpg"
+    copy.write_bytes(_jpeg(451, 1024))
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(copy)
+    assert "too generic" in report["reduced_copy"]["note"]
+
+
+def test_a_same_named_file_saved_after_the_paste_is_not_the_original(cursor_paste):
+    copy, downloads = cursor_paste
+    later = downloads / "Meetup iOS 26.png"
+    later.write_bytes(_png(1179, 2676))
+    pasted_at = copy.stat().st_mtime
+    os.utime(later, (pasted_at + 3600, pasted_at + 3600))
+    path, report = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(copy) and "reduced_copy" in report
+
+
+def test_the_most_recent_of_two_originals_wins(cursor_paste):
+    copy, downloads = cursor_paste
+    pasted_at = copy.stat().st_mtime
+    old = downloads / "old"
+    old.mkdir()
+    (old / "Meetup iOS 26.png").write_bytes(_png(1290, 2928))
+    os.utime(old / "Meetup iOS 26.png", (pasted_at - 86400 * 30,) * 2)
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 2676))
+    os.utime(downloads / "Meetup iOS 26.png", (pasted_at - 60,) * 2)
+    path, _ = critique_source._pick_image(str(copy), exact=False)
+    assert path == str(downloads / "Meetup iOS 26.png")
+
+
+def test_a_cursor_file_that_was_not_shrunk_is_not_called_reduced(monkeypatch, tmp_path):
+    monkeypatch.setattr(critique_source, "SEARCH_DIRS", (str(tmp_path / "none"),))
+    assets = tmp_path / ".cursor" / "projects" / "p" / "assets"
+    assets.mkdir(parents=True)
+    copy = assets / f"Hero-{UUID}.png"
+    copy.write_bytes(_png(1440, 2400))
+    assert critique_source._pick_image(str(copy), exact=False) == (str(copy), {})
+
+
+def test_a_windows_cursor_path_is_recognised():
+    path = "C:\\Users\\me\\.cursor\\projects\\x\\assets\\Shot-" + UUID + ".jpg"
+    assert critique_source._cursor_copy_stem(path) == "Shot"
+
+
+def test_an_original_over_the_limit_falls_back_to_the_copy(monkeypatch, cursor_paste, config, capsys):
+    copy, downloads = cursor_paste
+    (downloads / "Meetup iOS 26.png").write_bytes(_png(1179, 2676) + b"\0" * 4096)
+    monkeypatch.setattr(critique_source, "MAX_UPLOAD_BYTES", 2048)
+    sent = {}
+
+    def urlopen(req, timeout):
+        sent.update(body=req.data)
+        return _Response(b'{"source_id": "c.jpg"}')
+
+    monkeypatch.setattr(critique_source.urllib.request, "urlopen", urlopen)
+    critique_source.upload(str(copy))
+    out = json.loads(capsys.readouterr().out)
+    assert sent["body"] == copy.read_bytes()
+    assert "original" not in out
+    assert out["original_too_large"]["path"] == str(downloads / "Meetup iOS 26.png")
+
+
+def test_an_oversized_image_fails_with_an_image_message(monkeypatch, tmp_path, config, capsys):
+    shot = tmp_path / "big.png"
+    shot.write_bytes(_png(1440, 900) + b"\0" * 4096)
+    monkeypatch.setattr(critique_source, "MAX_UPLOAD_BYTES", 1024)
+    with pytest.raises(SystemExit):
+        critique_source.upload(str(shot))
+    err = capsys.readouterr()
+    text = err.out + err.err
+    assert "once bundled" not in text and "Export a smaller copy" in text

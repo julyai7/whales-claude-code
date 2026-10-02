@@ -1,5 +1,5 @@
 {
-  "description": "Whales capture — observes design work the MCP tools structurally cannot see",
+  "description": "whales capture — observes design work the MCP tools structurally cannot see",
   "hooks": {
     "SessionStart": [
       {
@@ -9,6 +9,12 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
             "args": ["--event", "SessionStart"],
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_update.py",
+            "args": ["--session-start", "--host", "claude-code"],
             "timeout": 10
           }
         ]
