@@ -100,8 +100,7 @@ When the designer reacts to the critique, record it against **this critique**:
 
 Their own decisions about how the product should work, and plans or lists of
 proposed changes, are not reactions to the critique: don't record them with
-either tool. Approve once a change is built and they accept the result, never
-the plan for it.
+either tool.
 
 ## 4. Generate — only when asked
 
