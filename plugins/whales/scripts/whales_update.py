@@ -120,8 +120,6 @@ BUILTIN_CURSOR_HOOKS = {
     "postToolUse": [{"command": 'python3 "${HOME}/.whales/scripts/whales_hook.py" --event DesignContext --source cursor_hook', "matcher": "Write", "timeout": 5}],
     "preCompact": [{"command": 'python3 "${HOME}/.whales/scripts/whales_hook.py" --event PreCompact --source cursor_hook', "timeout": 10}],
     "stop": [{"command": 'python3 "${HOME}/.whales/scripts/whales_hook.py" --event Stop --source cursor_hook', "timeout": 10}],
-    "afterMCPExecution": [{"command": 'python3 "${HOME}/.whales/scripts/whales_hook.py" --event MCPToolResult --source cursor_hook', "timeout": 10}],
-    "afterAgentResponse": [{"command": 'python3 "${HOME}/.whales/scripts/whales_hook.py" --event AgentResponse --source cursor_hook', "timeout": 10}],
 }
 _HOOK_ARGS = re.compile(r'whales_hook\.py"?\s+(--event [A-Za-z]+ --source cursor_hook)\s*$')
 
