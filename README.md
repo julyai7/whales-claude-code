@@ -198,7 +198,7 @@ re-install.
 |---|---|
 | `whales status` | versions per app, the server, and what the last update did |
 | `whales update` | check now instead of at the next session start |
-| `whales doctor [--fix]` | find, and repair, anything missing or out of date |
+| `whales doctor [--fix] [--online]` | find, and repair, anything missing or out of date; `--online` also asks the server whether it accepts your token |
 | `whales logs` | the last update's output |
 | `whales install claude\|cursor` | connect another app with the token already here (runs the installer's `--only`) |
 | `whales uninstall [claude\|cursor]` | disconnect one app, or everything |
