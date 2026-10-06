@@ -44,6 +44,7 @@ whales — your whales setup on this machine
   whales status              what is installed, and whether it is up to date
   whales update              check for a new whales now, instead of at the next session
   whales doctor [--fix]      find (and fix) anything missing or out of date
+                [--online]   also ask the whales server whether it accepts your token
   whales logs                what the last update did
   whales version             installed versions
   whales install claude|cursor
@@ -179,60 +180,167 @@ def cmd_logs(_args) -> int:
     return 0
 
 
-def _checks() -> list[tuple[bool, str]]:
+OK, WARN, BAD = "ok", "warn", "bad"
+DEFAULT_GATEWAY = "https://mcp.gojuly.ai"
+# Neither the updater nor `--fix` writes Cursor's server entry: only the
+# installer does, so that is what to send someone whose entry is wrong.
+REWRITE_CURSOR = "`whales install cursor` rewrites Cursor's whales entry with the token on this machine"
+
+
+def _gateway() -> str:
+    return (up._read_text(GATEWAY_FILE) or DEFAULT_GATEWAY).rstrip("/")
+
+
+def _cursor_entry() -> dict:
+    cfg = up._load_json(up.CURSOR_MCP) or {}
+    entry = (cfg.get("mcpServers") or {}).get("whales") if isinstance(cfg, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _cursor_token(entry: dict) -> str:
+    headers = entry.get("headers")
+    auth = str(headers.get("Authorization") or "") if isinstance(headers, dict) else ""
+    return auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
+
+
+def _checks() -> list[tuple[str, str, str]]:
+    """(level, what should be true, what to do when `--fix` cannot make it so)."""
     v = _versions()
-    out: list[tuple[bool, str]] = []
-    out.append((bool(up._read_text(TOKEN_FILE)), "a whales token is saved in ~/.whales/token"))
+    token = up._read_text(TOKEN_FILE)
+    app = (up._read_text(APP_URL_FILE) or DEFAULT_APP_URL).rstrip("/")
+    out: list[tuple[str, str, str]] = []
+
+    def check(passed: bool, text: str, hint: str = "") -> None:
+        out.append((OK if passed else BAD, text, hint))
+
+    check(bool(token), "a whales token is saved in ~/.whales/token",
+          f"run the install command from {app}/mcp")
     claude = up.find_claude()
     if claude or v["claude_code"]:
-        out.append((bool(v["claude_code"]), "the Claude Code plugin is installed"))
+        if v["claude_code"] or not v["cursor"]:
+            check(bool(v["claude_code"]), "the Claude Code plugin is installed",
+                  "`whales install claude` adds it")
+        else:
+            # Someone who uses whales through Cursor and happens to have
+            # Claude Code too has nothing wrong. `--fix` only updates an
+            # installed plugin, so as a failure this sent them looking for help.
+            out.append((WARN, "Claude Code is on this Mac but not connected to whales"
+                        " (`whales install claude` adds it)", ""))
         if v["claude_code"] and v["published"]:
-            out.append((v["claude_code"] == v["published"],
-                        f"the Claude Code plugin is the latest ({v['claude_code']} installed, {v['published']} out)"))
+            check(v["claude_code"] == v["published"],
+                  f"the Claude Code plugin is the latest ({v['claude_code']} installed, {v['published']} out)")
         settings = up._load_json(os.path.join(up.claude_config_dir(), "settings.json")) or {}
         allow = set(((settings.get("permissions") or {}).get("allow") or [])) if isinstance(settings, dict) else set()
         if v["claude_code"]:
             missing = [t for t in up.ALLOW_TOOLS if up.ALLOW_PREFIXES[0] + t not in allow]
-            out.append((not missing, "Claude Code won't ask before whales' read-and-record tools"
-                        + (f" (missing: {', '.join(missing)})" if missing else "")))
+            check(not missing, "Claude Code won't ask before whales' read-and-record tools"
+                  + (f" (missing: {', '.join(missing)})" if missing else ""))
     if v["cursor"]:
-        cfg = up._load_json(up.CURSOR_MCP) or {}
-        entry = (cfg.get("mcpServers") or {}).get("whales") if isinstance(cfg, dict) else None
-        out.append((isinstance(entry, dict), "Cursor has the whales server"))
-        out.append((v["cursor_mcp"] == v["files"] and bool(v["files"]),
-                    f"Cursor tells whales which version it runs ({v['cursor_mcp'] or 'nothing'})"))
-        out.append((up.has_our_cursor_entries(), "Cursor runs whales' capture hooks"))
-        out.append((os.path.isfile(up.WRAPPER) and not up.wrapper_outdated(),
-                    "Cursor's whales hook is the current one"))
-        out.append((os.path.isfile(up.CAPTURE), "the capture hook is in ~/.whales/scripts"))
-    out.append((os.path.isfile(up.HELPER), "the critique upload helper is in ~/.whales/scripts"))
+        entry = _cursor_entry()
+        check(bool(entry), "Cursor has the whales server", REWRITE_CURSOR)
+        if entry:
+            # Both are written once, by the installer, and nothing repairs
+            # them. A stale server address or a token from an earlier install
+            # leaves every other row green and Cursor quietly not connecting.
+            want = _gateway() + "/mcp"
+            url = str(entry.get("url") or "").rstrip("/")
+            check(url == want, f"Cursor points at the whales server ({url or 'no address'})",
+                  f"{REWRITE_CURSOR} and {want}")
+            if token:
+                check(_cursor_token(entry) == token, "Cursor sends the token saved in ~/.whales/token",
+                      REWRITE_CURSOR)
+        check(v["cursor_mcp"] == v["files"] and bool(v["files"]),
+              f"Cursor tells whales which version it runs ({v['cursor_mcp'] or 'nothing'})")
+        check(up.has_our_cursor_entries(), "Cursor runs whales' capture hooks")
+        check(os.path.isfile(up.WRAPPER) and not up.wrapper_outdated(),
+              "Cursor's whales hook is the current one")
+        check(os.path.isfile(up.CAPTURE), "the capture hook is in ~/.whales/scripts")
+    check(os.path.isfile(up.HELPER), "the critique upload helper is in ~/.whales/scripts")
     last = up.read_state().get("last_run") or {}
-    out.append((last.get("result") != "failed", "the last update succeeded"
-                + (f" (it said: {last.get('error')})" if last.get("result") == "failed" else "")))
+    check(last.get("result") != "failed", "the last update succeeded"
+          + (f" (it said: {last.get('error')})" if last.get("result") == "failed" else ""),
+          "`whales logs` shows what it tried")
     return out
 
 
-def _report(checks) -> list[str]:
-    for ok, text in checks:
-        (_ok if ok else _bad)(text)
+def _handshake(url: str, token: str) -> str:
+    """The HTTP status of an MCP `initialize`, the same one the installer
+    sends. curl rather than urllib: python.org's Python on a Mac often has no
+    certificates to verify TLS with."""
+    curl = shutil.which("curl")
+    if not curl:
+        return ""
+    r = subprocess.run(
+        [curl, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "15", "-X", "POST", url,
+         "-H", f"Authorization: Bearer {token}",
+         "-H", "Content-Type: application/json",
+         "-H", "Accept: application/json, text/event-stream",
+         "-d", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+             "protocolVersion": "2024-11-05", "capabilities": {},
+             "clientInfo": {"name": "whales-doctor", "version": "1"}}})],
+        capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def _online_check() -> tuple[str, str, str] | None:
+    """Opt-in (`--online`): the server sees this as the token being used,
+    which is the same signal that otherwise shows whether an app has ever
+    connected. It tests the token and address Cursor itself sends."""
+    entry = _cursor_entry() if up.cursor_wired() else {}
+    if entry:
+        url, token, whose = str(entry.get("url") or ""), _cursor_token(entry), "Cursor's"
+    else:
+        url, token, whose = _gateway() + "/mcp", up._read_text(TOKEN_FILE), "the saved"
+    if not url or not token:
+        return None
+    code = _handshake(url, token)
+    if code == "200":
+        return OK, f"the whales server accepts {whose} token", ""
+    if code in ("401", "403"):
+        app = (up._read_text(APP_URL_FILE) or DEFAULT_APP_URL).rstrip("/")
+        return (BAD, f"the whales server accepts {whose} token (it answered HTTP {code})",
+                f"get a fresh token at {app}/mcp and run its install command again")
+    # Offline, a proxy, a server hiccup: worth saying, not a fault on this machine.
+    return WARN, f"could not reach the whales server at {url} (HTTP {code or 'no answer'})", ""
+
+
+def _report(checks) -> list[tuple[str, str, str]]:
+    show = {OK: _ok, WARN: _warn, BAD: _bad}
+    for level, text, _hint in checks:
+        show[level](text)
     if not shutil.which("whales"):
         # A note, not a failure: PATH belongs to the designer's shell profile,
         # which nothing but the interactive installer edits.
         _warn(f"`whales` is not on your PATH; run it as {up.LAUNCHER}")
-    return [text for ok, text in checks if not ok]
+    return [c for c in checks if c[0] == BAD]
 
 
 def cmd_doctor(args) -> int:
-    if not _report(_checks()):
+    def run() -> list[tuple[str, str, str]]:
+        checks = _checks()
+        if "--online" in args:
+            online = _online_check()
+            if online:
+                checks.append(online)
+        return checks
+
+    if not _report(run()):
         print("\nEverything looks right.")
+        if up.cursor_wired():
+            # The one thing no check here can see: whether Cursor has loaded
+            # the server. It reads mcp.json only when it starts.
+            print("If whales is missing or red in Cursor Settings → MCP, quit Cursor (Cmd+Q) and reopen it.")
         return 0
     if "--fix" not in args:
         print("\nRun `whales doctor --fix` to repair what it can.")
         return 1
     print("\nRepairing…\n")
     _run_update(force=True)
-    if _report(_checks()):
-        print("\nSome of this needs a person. `whales logs` shows what the repair tried.")
+    failing = _report(run())
+    if failing:
+        print("\nStill to do:")
+        for _level, text, hint in failing:
+            print(f"  • {text}: {hint or 'the repair could not fix this; `whales logs` shows what it tried'}")
         return 1
     print()
     _ok("Repaired. Restart Claude Code and Cursor to pick it up.")

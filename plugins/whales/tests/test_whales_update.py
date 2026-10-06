@@ -270,6 +270,21 @@ class TestCursor:
         m.updater("--run", "--host", "cursor")
         assert MARKER in (m.whales / "scripts" / "whales_hook.py").read_text()
 
+    def test_an_existing_install_gains_events_a_new_version_adds(self, m):
+        """JUL-721: afterMCPExecution / afterAgentResponse reach designers whose
+        ~/.cursor/hooks.json was written before those events existed."""
+        m.install_plugin("0.6.0", "0.6.0")
+        cursor = _cursor_machine(m)
+        before = json.loads((cursor / "hooks.json").read_text())["hooks"]
+        assert "afterMCPExecution" not in before
+        m.updater("--run", "--host", "cursor")
+        hooks = json.loads((cursor / "hooks.json").read_text())["hooks"]
+        wrapper = str(m.whales / "scripts" / "whales_hook.py")
+        for event, name in (("afterMCPExecution", "MCPToolResult"), ("afterAgentResponse", "AgentResponse")):
+            (entry,) = hooks[event]
+            assert wrapper in entry["command"] and f"--event {name} --source cursor_hook" in entry["command"]
+        assert {"command": "someone-else.sh"} in hooks["stop"]
+
     def test_hooks_a_designer_removed_stay_removed(self, m):
         m.install_plugin("0.6.0", "0.6.0")
         cursor = _cursor_machine(m, our_hooks=False)
