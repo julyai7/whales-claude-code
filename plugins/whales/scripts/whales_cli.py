@@ -217,15 +217,12 @@ def _checks() -> list[tuple[str, str, str]]:
           f"run the install command from {app}/mcp")
     claude = up.find_claude()
     if claude or v["claude_code"]:
-        if v["claude_code"] or not v["cursor"]:
-            check(bool(v["claude_code"]), "the Claude Code plugin is installed",
-                  "`whales install claude` adds it")
-        else:
-            # Someone who uses whales through Cursor and happens to have
-            # Claude Code too has nothing wrong. `--fix` only updates an
-            # installed plugin, so as a failure this sent them looking for help.
-            out.append((WARN, "Claude Code is on this Mac but not connected to whales"
-                        " (`whales install claude` adds it)", ""))
+        # A failure even when Cursor is connected: having Cursor set up says
+        # nothing about which app someone works in, and a Claude Code user
+        # whose install only reached Cursor is exactly who this row is for.
+        # `--fix` cannot install a plugin, so the hint says what will.
+        check(bool(v["claude_code"]), "the Claude Code plugin is installed",
+              "`whales install claude` adds it" + (" (skip this if you only use Cursor)" if v["cursor"] else ""))
         if v["claude_code"] and v["published"]:
             check(v["claude_code"] == v["published"],
                   f"the Claude Code plugin is the latest ({v['claude_code']} installed, {v['published']} out)")

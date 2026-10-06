@@ -128,25 +128,33 @@ def _cursor_says(m: Machine, **changes) -> None:
     mcp.write_text(json.dumps(cfg))
 
 
-def test_doctor_cursor_only_with_claude_code_around_is_not_a_failure(m):
+def test_doctor_says_how_to_add_a_missing_claude_code_plugin(m):
+    """Cursor connected does not mean Cursor is the app in use: a Claude Code
+    user whose install only reached Cursor must still see a failure."""
     _wired_cursor(m)
-    _drop_claude_code_plugin(m)
-    r = whales(m, "doctor")
-    assert r.returncode == 0, r.stdout
-    assert "! Claude Code is on this Mac but not connected to whales (`whales install claude` adds it)" in r.stdout
-    assert "✗" not in r.stdout
-    assert "Everything looks right." in r.stdout
-    assert "quit Cursor (Cmd+Q) and reopen it" in r.stdout
-
-
-def test_doctor_without_any_host_still_fails_on_the_missing_plugin(m):
-    (m.whales / "token").write_text("t")
     _drop_claude_code_plugin(m)
     r = whales(m, "doctor", "--fix")
     assert r.returncode == 1
     assert "✗ the Claude Code plugin is installed" in r.stdout
-    assert "• the Claude Code plugin is installed: `whales install claude` adds it" in r.stdout
+    assert ("• the Claude Code plugin is installed: `whales install claude` adds it"
+            " (skip this if you only use Cursor)") in r.stdout
     assert "needs a person" not in r.stdout
+
+
+def test_doctor_without_cursor_does_not_mention_it(m):
+    (m.whales / "token").write_text("t")
+    _drop_claude_code_plugin(m)
+    r = whales(m, "doctor", "--fix")
+    assert r.returncode == 1
+    assert "• the Claude Code plugin is installed: `whales install claude` adds it\n" in r.stdout
+
+
+def test_doctor_all_green_reminds_that_cursor_loads_servers_at_startup(m):
+    _wired_cursor(m)
+    r = whales(m, "doctor")
+    assert r.returncode == 0, r.stdout
+    assert "✗" not in r.stdout
+    assert "quit Cursor (Cmd+Q) and reopen it" in r.stdout
 
 
 def test_doctor_catches_a_cursor_entry_that_drifted(m):
