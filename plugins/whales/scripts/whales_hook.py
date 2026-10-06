@@ -117,9 +117,20 @@ SESSION_PREFIX = {"claude_code_hook": "cc", "cursor_hook": "cur"}
 
 # Keys that may carry a whole file. Kept but truncated: the point of capturing
 # an edit is knowing which values changed, and a multi-megabyte file would
-# bloat the store without adding signal.
-_BULKY_KEYS = ("content", "new_string", "old_string", "prompt", "response", "output")
+# bloat the store without adding signal. Cursor's afterMCPExecution carries
+# the tool's arguments and answer as `tool_input` / `result_json` (a Figma
+# MCP result runs to megabytes), and afterAgentResponse the reply as `text`.
+_BULKY_KEYS = ("content", "new_string", "old_string", "prompt", "response", "output",
+               "result_json", "tool_input", "text")
 _MAX_FIELD_CHARS = 20_000
+
+# Cursor events that record what was said or returned, not a turn of work:
+# afterMCPExecution (an MCP tool's answer, which Cursor's transcript never
+# keeps) and afterAgentResponse (the agent's reply, which its stop event does
+# not carry). They ship without a transcript chunk: they fire on every MCP
+# call, Stop already ships the transcript, and the backend's reaction pass
+# reads a chunk on any hook row as the designer's own words.
+_NO_TRANSCRIPT_EVENTS = ("MCPToolResult", "AgentResponse")
 
 # Most bytes we will ship from a transcript in one call. A long session's
 # JSONL grows without bound, and a single turn should never mail a 40MB file.
@@ -1156,6 +1167,16 @@ def main() -> int:
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
 
+    if args.event == "MCPToolResult":
+        # Cursor documents both as JSON strings; a structured value would slip
+        # past truncate(), which caps strings only.
+        for key in ("tool_input", "result_json"):
+            if event.get(key) is not None and not isinstance(event[key], str):
+                try:
+                    event[key] = json.dumps(event[key], default=str)
+                except (TypeError, ValueError):
+                    event[key] = str(event[key])
+
     session_key = f"{prefix}:{session_id}" if session_id else None
     payload = {
         "source": args.source,
@@ -1184,7 +1205,7 @@ def main() -> int:
     # Otherwise the transcript rides along only with the session's upload
     # lock: an upload already in flight will drain what this event would have
     # sent, and sending it here too would ship it twice.
-    transcript_path = event.get("transcript_path", "")
+    transcript_path = "" if args.event in _NO_TRANSCRIPT_EVENTS else event.get("transcript_path", "")
     text, new_offset, more_pending, start = "", None, False, None
     lock = None
     if state != "rejected" and session_id and transcript_path:
