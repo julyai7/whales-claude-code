@@ -49,6 +49,18 @@
         "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event Stop --source cursor_hook",
         "timeout": 10
       }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event MCPToolResult --source cursor_hook",
+        "timeout": 10
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "python3 \"${HOME}/.whales/scripts/whales_hook.py\" --event AgentResponse --source cursor_hook",
+        "timeout": 10
+      }
     ]
   }
 }

@@ -1080,6 +1080,76 @@ class TestCursorHost:
             capture_output=True, text=True, env=dict(os.environ, HOME=str(tmp_path)), timeout=20)
         assert r.returncode == 0 and r.stdout.strip() == ""
 
+    # -- afterMCPExecution / afterAgentResponse (JUL-721) ---------------------
+
+    def _connected(self, home):
+        server, received = _serve(200)
+        (home / ".whales").mkdir()
+        (home / ".whales" / "token").write_text("tok")
+        (home / ".whales" / "gateway").write_text(f"http://127.0.0.1:{server.server_address[1]}")
+        return received
+
+    def _transcript(self, home):
+        path = home / "t.jsonl"
+        path.write_text('{"role":"user","message":{"content":"hi"}}\n')
+        return str(path)
+
+    def test_an_mcp_tool_result_is_posted_capped_and_without_the_transcript(self, tmp_path):
+        """Cursor's transcript keeps no tool results; this is the only host-side
+        record of what an MCP tool answered."""
+        received = self._connected(tmp_path)
+        big = json.dumps({"content": [{"type": "text", "text": "x" * 30_000}]})
+        r = self._run("MCPToolResult", {
+            "conversation_id": "c1", "hook_event_name": "afterMCPExecution",
+            "tool_name": "whales", "tool_input": json.dumps({"request": "my Zesty style?"}),
+            "result_json": big, "duration": 4210, "transcript_path": self._transcript(tmp_path),
+        }, tmp_path)
+        _wait_for(received)
+        assert r.returncode == 0 and r.stdout.strip() == ""
+        raw = received["body"]["raw_payload"]
+        assert received["body"]["session_id"] == "cur:c1"
+        assert raw["whales_event"] == "MCPToolResult"
+        assert raw["tool_name"] == "whales"
+        assert len(raw["result_json"]) == wh._MAX_FIELD_CHARS
+        assert raw["result_json_truncated_from"] == len(big)
+        assert "transcript_delta" not in raw, "Stop ships the transcript"
+
+    def test_a_structured_tool_result_is_capped_too(self, tmp_path):
+        received = self._connected(tmp_path)
+        self._run("MCPToolResult", {"conversation_id": "c1", "tool_name": "figma",
+                                    "tool_input": {"html": "y" * 30_000},
+                                    "result_json": {"nodes": ["z" * 30_000]}}, tmp_path)
+        _wait_for(received)
+        raw = received["body"]["raw_payload"]
+        assert isinstance(raw["result_json"], str) and len(raw["result_json"]) == wh._MAX_FIELD_CHARS
+        assert isinstance(raw["tool_input"], str) and len(raw["tool_input"]) == wh._MAX_FIELD_CHARS
+
+    def test_an_agent_reply_is_posted_without_the_transcript(self, tmp_path):
+        received = self._connected(tmp_path)
+        r = self._run("AgentResponse", {"conversation_id": "c1", "hook_event_name": "afterAgentResponse",
+                                        "text": "Built it with pill buttons.",
+                                        "transcript_path": self._transcript(tmp_path)}, tmp_path)
+        _wait_for(received)
+        assert r.returncode == 0
+        raw = received["body"]["raw_payload"]
+        assert raw["whales_event"] == "AgentResponse" and raw["text"] == "Built it with pill buttons."
+        assert "transcript_delta" not in raw
+
+    def test_a_secret_in_a_tool_result_is_scrubbed(self, tmp_path):
+        received = self._connected(tmp_path)
+        self._run("MCPToolResult", {"conversation_id": "c1", "tool_name": "x",
+                                    "result_json": "key ghp_abcdefghijklmnopqrstuvwxyz0123456789AB"}, tmp_path)
+        _wait_for(received)
+        assert "ghp_abcdefghijklmnop" not in received["body"]["raw_payload"]["result_json"]
+
+    def test_garbage_input_still_exits_zero(self, tmp_path):
+        self._connected(tmp_path)
+        r = subprocess.run(
+            [sys.executable, str(HOOK), "--event", "MCPToolResult", "--source", "cursor_hook"],
+            input="not json", capture_output=True, text=True,
+            env=dict(os.environ, HOME=str(tmp_path)), timeout=20)
+        assert r.returncode == 0
+
     # -- the one list of Cursor events ----------------------------------------
 
     def test_cursor_hooks_json_is_the_full_event_list_and_runs_the_wrapper(self):
@@ -1089,9 +1159,10 @@ class TestCursorHost:
         assert cfg["version"] == 1
         events = cfg["hooks"]
         assert set(events) == {"sessionStart", "sessionEnd", "beforeSubmitPrompt", "afterFileEdit",
-                               "preToolUse", "postToolUse", "preCompact", "stop"}
+                               "preToolUse", "postToolUse", "preCompact", "stop",
+                               "afterMCPExecution", "afterAgentResponse"}
         known = {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse", "PreToolUse",
-                 "DesignContext", "PreCompact", "Stop"}
+                 "DesignContext", "PreCompact", "Stop", "MCPToolResult", "AgentResponse"}
         for name, entries in events.items():
             assert len(entries) == 1, name
             command = entries[0]["command"]
