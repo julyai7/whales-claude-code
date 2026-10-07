@@ -1172,3 +1172,81 @@ class TestCursorHost:
         assert events["postToolUse"][0]["matcher"] == "Write"
         assert "DesignContext" in events["postToolUse"][0]["command"]
         assert "matcher" not in events["preToolUse"][0]
+
+
+class TestScreens:
+    """What the designer saw, stitched to the turn: pasted Cursor screenshots
+    and the Simulator after UI edits."""
+
+    PASTED = ("/Users/d/.cursor/projects/Users-d-Projects-ios/assets/"
+              "Screenshot_iPhone_18_Pro_10-06-2026_at_3.18.11_PM-542f8d19-11eb-4fc7-a528-552f83569617.png")
+
+    @pytest.fixture(autouse=True)
+    def _dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(wh, "SCREENS_DIR", str(tmp_path / "screens"))
+        monkeypatch.delenv("WHALES_SCREENS", raising=False)
+
+    def test_a_pasted_cursor_image_is_a_screen(self):
+        event = {"hook_event_name": "afterFileEdit", "file_path": self.PASTED, "edits": [{"old_string": "", "new_string": ""}]}
+        assert wh.pasted_screenshot(event, "PostToolUse") == self.PASTED
+        job = wh.screen_job(event, "PostToolUse", "s1")
+        assert job == {"origin": "pasted", "path": self.PASTED, "session_id": "s1"}
+
+    def test_an_image_the_agent_writes_into_the_repo_is_not(self):
+        event = {"file_path": "/Users/d/Projects/ios/Assets.xcassets/icon.png"}
+        assert wh.pasted_screenshot(event, "PostToolUse") == ""
+
+    def test_simulator_after_ui_edits_once_per_batch(self):
+        wh.note_ui_edit({"file_path": "/repo/RootTabView.swift"}, "PostToolUse", "s1")
+        wh.note_ui_edit({"tool_input": {"file_path": "/repo/README.md"}}, "PostToolUse", "s1")
+        job = wh.screen_job({}, "Stop", "s1")
+        assert job["origin"] == "simulator" and job["last_ui_edit_at"]
+        assert wh.screen_job({}, "Stop", "s1") is None, "no new UI edit, no new screen"
+
+    def test_no_ui_edit_no_simulator(self):
+        wh.note_ui_edit({"file_path": "/repo/service.py"}, "PostToolUse", "s1")
+        assert wh.screen_job({}, "Stop", "s1") is None
+
+    def test_screens_can_be_turned_off(self, monkeypatch):
+        monkeypatch.setenv("WHALES_SCREENS", "off")
+        assert wh.screen_job({"file_path": self.PASTED}, "PostToolUse", "s1") is None
+
+    def test_screen_is_stamped_on_the_event(self, monkeypatch):
+        monkeypatch.setattr(wh, "capture_screen", lambda job: {"origin": "pasted", "source_id": "abc.png"})
+        body = json.dumps({"source": "cursor_hook", "raw_payload": {"whales_event": "PostToolUse"}}).encode()
+        out = json.loads(wh.with_screen(body, {"origin": "pasted", "path": self.PASTED, "session_id": "s1"}))
+        assert out["raw_payload"]["whales_screen"] == {"origin": "pasted", "source_id": "abc.png"}
+
+    def test_a_failing_screen_never_costs_the_event(self, monkeypatch):
+        def boom(job):
+            raise RuntimeError("simctl exploded")
+        monkeypatch.setattr(wh, "capture_screen", boom)
+        body = b'{"raw_payload": {}}'
+        assert wh.with_screen(body, {"origin": "simulator", "session_id": "s1"}) == body
+
+    def test_pasted_image_uploads_once(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(wh, "upload_screen", lambda path: calls.append(path) or {"source_id": "abc.png"})
+        job = {"origin": "pasted", "path": self.PASTED, "session_id": "s1"}
+        first, again = wh.capture_screen(job), wh.capture_screen(job)
+        assert calls == [self.PASTED]
+        assert first == again and first["source_id"] == "abc.png"
+
+    def test_upload_reads_the_helpers_result(self, tmp_path, monkeypatch):
+        helper = tmp_path / "critique_source.py"
+        helper.write_text("import json\nprint(json.dumps({'source_id': 'f00.png', 'width': 1206, 'secret': 1}))\n")
+        monkeypatch.setattr(wh, "_upload_helper", lambda: str(helper))
+        assert wh.upload_screen("/x.png") == {"source_id": "f00.png", "width": 1206}
+
+    def test_upload_failure_is_recorded_not_raised(self, tmp_path, monkeypatch):
+        helper = tmp_path / "critique_source.py"
+        helper.write_text("import sys\nsys.stderr.write('403 critique not enabled')\nsys.exit(1)\n")
+        monkeypatch.setattr(wh, "_upload_helper", lambda: str(helper))
+        assert wh.upload_screen("/x.png") == {"error": "403 critique not enabled"}
+
+    def test_no_simulator_no_screen(self, monkeypatch):
+        class Done:
+            stdout = '{"devices": {"iOS-26": [{"state": "Shutdown", "udid": "u", "name": "iPhone"}]}}'
+        monkeypatch.setattr(wh.subprocess, "run", lambda *a, **k: Done())
+        assert wh.simulator_screenshot("/tmp/x.png") == {}
+        assert wh.capture_screen({"origin": "simulator", "session_id": "s1"}) == {}
