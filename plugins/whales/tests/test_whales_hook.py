@@ -836,6 +836,7 @@ class TestOneUploadPerSession:
         ranges = [b["raw_payload"]["transcript_delta_range"] for b in bodies[1:]]
         assert ranges[0][0] == end and ranges[-1][1] == t.stat().st_size
         assert {b["raw_payload"]["hook_event_name"] for b in bodies[1:]} == {"TranscriptChunk"}
+        assert all(b["raw_payload"]["client_ts"] for b in bodies[1:]), "drained chunks are ordered too"
         assert wh.transcript_delta(str(t), "s1")[0] == ""
         assert not os.path.exists(wh._lock_path("s1"))
 
@@ -1172,3 +1173,300 @@ class TestCursorHost:
         assert events["postToolUse"][0]["matcher"] == "Write"
         assert "DesignContext" in events["postToolUse"][0]["command"]
         assert "matcher" not in events["preToolUse"][0]
+
+
+class TestScreens:
+    """What the designer saw, stitched to the turn: pasted Cursor screenshots
+    and the Simulator after UI edits. Nothing here may reach the real simctl
+    or the real uploader: simulator_screenshot and upload_screen are always
+    replaced."""
+
+    PASTED = ("/Users/d/.cursor/projects/Users-d-Projects-ios/assets/"
+              "Screenshot_iPhone_18_Pro_10-06-2026_at_3.18.11_PM-542f8d19-11eb-4fc7-a528-552f83569617.png")
+
+    @pytest.fixture(autouse=True)
+    def _dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(wh, "SCREENS_DIR", str(tmp_path / "screens"))
+        monkeypatch.delenv("WHALES_SCREENS", raising=False)
+
+    def _pasted_file(self, tmp_path, content=b"\x89PNG pasted"):
+        path = tmp_path / ".cursor" / "projects" / "Users-d-ios" / "assets" / "Screenshot-1.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return str(path)
+
+    def _main(self, monkeypatch, home, event_name, event):
+        """Run main() in-process up to the detached send, and return what it
+        would have handed to post_detached."""
+        import io
+
+        monkeypatch.setattr(wh, "CONFIG_DIR", str(home))
+        monkeypatch.setattr(wh, "TOKEN_FILE", str(home / "token"))
+        monkeypatch.setattr(wh, "GATEWAY_FILE", str(home / "gateway"))
+        monkeypatch.setattr(wh, "STATUS_FILE", str(home / "capture_status.json"))
+        monkeypatch.setattr(wh, "OFFSET_DIR", str(home / "offsets"))
+        monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(home / "synthetic"))
+        (home / "token").write_text("tok")
+        calls = []
+        monkeypatch.setattr(wh, "post_detached", lambda *a, **k: calls.append((a, k)))
+        monkeypatch.setattr(sys, "argv", ["whales_hook.py", "--event", event_name])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(event)))
+        assert wh.main() == 0
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        return json.loads(args[2]), kwargs
+
+    def test_a_pasted_cursor_image_is_a_screen(self):
+        event = {"hook_event_name": "afterFileEdit", "file_path": self.PASTED, "edits": [{"old_string": "", "new_string": ""}]}
+        assert wh.pasted_screenshot(event, "PostToolUse") == self.PASTED
+        job = wh.screen_job(event, "PostToolUse", "s1")
+        assert job == {"origin": "pasted", "path": self.PASTED, "session_id": "s1"}
+
+    def test_an_image_the_agent_writes_into_the_repo_is_not(self):
+        event = {"file_path": "/Users/d/Projects/ios/Assets.xcassets/icon.png"}
+        assert wh.pasted_screenshot(event, "PostToolUse") == ""
+
+    # --- the Simulator is read at the next prompt, not at Stop -------------
+
+    def test_the_simulator_is_read_at_the_next_prompt_not_at_stop(self):
+        # The designer rebuilds after the turn ends: at Stop the Simulator
+        # still shows the build from before the edit.
+        wh.note_ui_edit({"file_path": "/repo/RootTabView.swift"}, "PostToolUse", "s1")
+        assert wh.screen_job({}, "Stop", "s1") is None
+        job = wh.screen_job({"prompt": "the tab bar is too tall"}, "UserPromptSubmit", "s1")
+        assert job["origin"] == "simulator" and job["last_ui_edit_at"]
+
+    def test_one_simulator_screen_per_batch_of_edits(self):
+        wh.note_ui_edit({"file_path": "/repo/RootTabView.swift"}, "PostToolUse", "s1")
+        wh.note_ui_edit({"tool_input": {"file_path": "/repo/README.md"}}, "PostToolUse", "s1")
+        assert wh.screen_job({}, "UserPromptSubmit", "s1")["origin"] == "simulator"
+        assert wh.screen_job({}, "UserPromptSubmit", "s1") is None, "no new UI edit, no new screen"
+
+    def test_no_ui_edit_no_simulator(self):
+        wh.note_ui_edit({"file_path": "/repo/service.py"}, "PostToolUse", "s1")
+        assert wh.screen_job({}, "UserPromptSubmit", "s1") is None
+
+    def test_a_simulator_screen_says_it_shows_the_previous_turn(self, monkeypatch):
+        monkeypatch.setattr(wh, "simulator_screenshot", lambda out: {"device": "iPhone 18 Pro", "booted_devices": 1})
+        monkeypatch.setattr(wh, "upload_screen", lambda path: {"source_id": "sim.png"})
+        info = wh.capture_screen({"origin": "simulator", "last_ui_edit_at": "2026-10-06T22:18:00Z",
+                                  "session_id": "s1"})
+        assert info["shows"] == "after_previous_turn"
+        assert info["last_ui_edit_at"] == "2026-10-06T22:18:00Z" and info["taken_at"]
+        assert info["source_id"] == "sim.png"
+
+    def test_the_simulator_reports_when_its_newest_app_was_installed(self, tmp_path, monkeypatch):
+        data = tmp_path / "device-data"
+        old = data / "Containers" / "Bundle" / "Application" / "A" / "Settings.app"
+        new = data / "Containers" / "Bundle" / "Application" / "B" / "Matterhaul.app"
+        for app, at in ((old, 1_700_000_000), (new, 1_700_000_000)):
+            app.mkdir(parents=True)
+            (app / "Info.plist").write_text("")
+            os.utime(app / "Info.plist", (at, at))
+            os.utime(app, (at, at))
+        # Rebuilt in place: only the executable inside the bundle is newer.
+        (new / "Matterhaul").write_text("")
+        os.utime(new / "Matterhaul", (1_800_000_000, 1_800_000_000))
+        os.utime(new, (1_700_000_000, 1_700_000_000))
+        out = tmp_path / "shot.png"
+
+        class Done:
+            returncode = 0
+            stdout = json.dumps({"devices": {"iOS-26": [{"state": "Booted", "udid": "u",
+                                                         "name": "iPhone", "dataPath": str(data)}]}})
+
+        def run(cmd, **kwargs):
+            if "screenshot" in cmd:
+                out.write_bytes(b"png")
+            return Done()
+
+        monkeypatch.setattr(wh.subprocess, "run", run)
+        monkeypatch.setattr(wh.sys, "platform", "darwin")
+        info = wh.simulator_screenshot(str(out))
+        assert info["newest_app"] == "Matterhaul.app"
+        assert info["newest_app_installed_at"] == "2027-01-15T08:00:00Z"
+
+    # --- only iOS UI edits ask for the Simulator -----------------------------
+
+    @pytest.mark.parametrize("path", ["/repo/Home.swift", "/repo/Base.lproj/Main.storyboard",
+                                      "/repo/Cell.xib"])
+    def test_ios_ui_edits_ask_for_the_simulator(self, path):
+        wh.note_ui_edit({"file_path": path}, "PostToolUse", "s1")
+        assert wh.take_ui_edit("s1")
+
+    @pytest.mark.parametrize("path", ["/web/src/App.tsx", "/web/src/Card.jsx", "/web/index.html",
+                                      "/web/styles.css", "/web/App.vue", "/android/Home.kt",
+                                      "/flutter/home.dart"])
+    def test_web_and_android_edits_never_run_simctl(self, path):
+        # simctl is the only capture there is: after a web edit it would read
+        # an unrelated booted Simulator, or start CoreSimulator for nothing.
+        wh.note_ui_edit({"file_path": path}, "PostToolUse", "s1")
+        assert wh.take_ui_edit("s1") == ""
+        assert wh.screen_job({}, "UserPromptSubmit", "s1") is None
+
+    def test_screens_can_be_turned_off(self, monkeypatch):
+        monkeypatch.setenv("WHALES_SCREENS", "off")
+        assert wh.screen_job({"file_path": self.PASTED}, "PostToolUse", "s1") is None
+
+    # --- stamping, and ordering by the client's clock ------------------------
+
+    def test_screen_is_stamped_on_the_event(self, monkeypatch):
+        monkeypatch.setattr(wh, "capture_screen", lambda job: {"origin": "pasted", "source_id": "abc.png"})
+        body = json.dumps({"source": "cursor_hook", "raw_payload": {"whales_event": "PostToolUse"}}).encode()
+        out = json.loads(wh.with_screen(body, {"origin": "pasted", "path": self.PASTED, "session_id": "s1"}))
+        assert out["raw_payload"]["whales_screen"] == {"origin": "pasted", "source_id": "abc.png"}
+
+    def test_a_failing_screen_never_costs_the_event(self, monkeypatch):
+        def boom(job):
+            raise RuntimeError("simctl exploded")
+        monkeypatch.setattr(wh, "capture_screen", boom)
+        body = b'{"raw_payload": {}}'
+        assert wh.with_screen(body, {"origin": "simulator", "session_id": "s1"}) == body
+
+    def test_every_event_carries_the_time_it_was_sent(self, tmp_path, monkeypatch):
+        import re
+
+        body, _ = self._main(monkeypatch, tmp_path, "PostToolUse",
+                             {"session_id": "s1", "tool_input": {"file_path": "/repo/a.py"}})
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", body["raw_payload"]["client_ts"])
+
+    def test_a_screen_event_keeps_the_time_from_before_its_screen_work(self, tmp_path, monkeypatch):
+        # The screen is captured and uploaded before the event is sent (up to
+        # two minutes); the event must still order where it happened.
+        import time as _time
+
+        wh.note_ui_edit({"file_path": "/repo/Home.swift"}, "PostToolUse", "s1")
+        body, kwargs = self._main(monkeypatch, tmp_path, "UserPromptSubmit",
+                                  {"session_id": "s1", "prompt": "tighter"})
+        stamped = body["raw_payload"]["client_ts"]
+        assert kwargs["screen"]["origin"] == "simulator"
+
+        seen = {}
+
+        def slow_capture(job):
+            _time.sleep(0.01)
+            seen["capture_started"] = datetime_now()
+            return {"origin": "simulator", "source_id": "sim.png"}
+
+        sent = []
+        monkeypatch.setattr(wh, "capture_screen", slow_capture)
+        monkeypatch.setattr(wh, "_send", lambda url, token, b: sent.append(json.loads(b)) or (True, 200, ""))
+        wh.deliver("http://x", "tok", json.dumps(body).encode(), "s1", None, "", screen=kwargs["screen"])
+        assert sent[0]["raw_payload"]["client_ts"] == stamped < seen["capture_started"]
+        assert sent[0]["raw_payload"]["whales_screen"]["source_id"] == "sim.png"
+
+    # --- screen work never holds the transcript lock -------------------------
+
+    def test_an_event_with_a_screen_does_not_hold_the_upload_lock(self, tmp_path, monkeypatch):
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("a turn\n")
+        pasted = self._pasted_file(tmp_path)
+        body, kwargs = self._main(monkeypatch, tmp_path, "PostToolUse",
+                                  {"session_id": "s1", "transcript_path": str(transcript),
+                                   "file_path": pasted})
+        assert kwargs["screen"]["origin"] == "pasted"
+        assert kwargs["lock"] is None and not os.path.exists(wh._lock_path("s1"))
+        assert "transcript_delta" not in body["raw_payload"], "the next event ships it"
+
+        # The next event takes the lock and ships the transcript as usual.
+        body, kwargs = self._main(monkeypatch, tmp_path, "Stop",
+                                  {"session_id": "s1", "transcript_path": str(transcript)})
+        assert kwargs["screen"] is None and kwargs["lock"]
+        assert body["raw_payload"]["transcript_delta"] == "a turn\n"
+
+    # --- a pasted image is uploaded once -------------------------------------
+
+    def test_pasted_image_uploads_once(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(wh, "upload_screen", lambda path: calls.append(path) or {"source_id": "abc.png"})
+        job = {"origin": "pasted", "path": self._pasted_file(tmp_path), "session_id": "s1"}
+        first, again = wh.capture_screen(job), wh.capture_screen(job)
+        assert calls == [job["path"]]
+        assert first == again and first["source_id"] == "abc.png"
+
+    def test_reports_arriving_together_upload_once(self, tmp_path, monkeypatch):
+        import threading
+        import time as _time
+
+        calls = []
+
+        def slow_upload(path):
+            calls.append(path)
+            _time.sleep(0.2)
+            return {"source_id": "abc.png"}
+
+        monkeypatch.setattr(wh, "upload_screen", slow_upload)
+        path = self._pasted_file(tmp_path)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            wh.capture_screen({"origin": "pasted", "path": path, "session_id": "s1"})))
+            for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(calls) == 1
+        assert [r.get("source_id") for r in results].count("abc.png") == 1, \
+            "only the uploader's event carries the screen"
+
+    def test_a_failed_upload_is_not_retried_by_every_repeat(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(wh, "upload_screen",
+                            lambda path: calls.append(path) or {"error": "403 critique not enabled"})
+        job = {"origin": "pasted", "path": self._pasted_file(tmp_path), "session_id": "s1"}
+        first, again = wh.capture_screen(job), wh.capture_screen(job)
+        assert len(calls) == 1
+        assert first["error"] == again["error"] == "403 critique not enabled"
+
+        # A while later, the next report tries again.
+        claim = os.path.join(wh.SCREENS_DIR, "pasted", _sha256(job["path"]))
+        old = os.path.getmtime(claim) - getattr(wh, "_PASTE_RETRY_SECONDS", 3600) - 5
+        os.utime(claim, (old, old))
+        wh.capture_screen(job)
+        assert len(calls) == 2
+
+    def test_a_claim_left_by_a_dead_upload_is_taken_over(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(wh, "upload_screen", lambda path: calls.append(path) or {"source_id": "abc.png"})
+        job = {"origin": "pasted", "path": self._pasted_file(tmp_path), "session_id": "s1"}
+        claim = os.path.join(wh.SCREENS_DIR, "pasted", _sha256(job["path"]))
+        os.makedirs(os.path.dirname(claim))
+        open(claim, "w").close()
+        assert wh.capture_screen(job) == {}, "another report is uploading it"
+        old = os.path.getmtime(claim) - 3600
+        os.utime(claim, (old, old))
+        assert wh.capture_screen(job)["source_id"] == "abc.png"
+        assert len(calls) == 1
+
+    # --- the upload helper and the Simulator ---------------------------------
+
+    def test_upload_reads_the_helpers_result(self, tmp_path, monkeypatch):
+        helper = tmp_path / "critique_source.py"
+        helper.write_text("import json\nprint(json.dumps({'source_id': 'f00.png', 'width': 1206, 'secret': 1}))\n")
+        monkeypatch.setattr(wh, "_upload_helper", lambda: str(helper))
+        assert wh.upload_screen("/x.png") == {"source_id": "f00.png", "width": 1206}
+
+    def test_upload_failure_is_recorded_not_raised(self, tmp_path, monkeypatch):
+        helper = tmp_path / "critique_source.py"
+        helper.write_text("import sys\nsys.stderr.write('403 critique not enabled')\nsys.exit(1)\n")
+        monkeypatch.setattr(wh, "_upload_helper", lambda: str(helper))
+        assert wh.upload_screen("/x.png") == {"error": "403 critique not enabled"}
+
+    def test_no_simulator_no_screen(self, monkeypatch):
+        class Done:
+            stdout = '{"devices": {"iOS-26": [{"state": "Shutdown", "udid": "u", "name": "iPhone"}]}}'
+        monkeypatch.setattr(wh.subprocess, "run", lambda *a, **k: Done())
+        assert wh.simulator_screenshot("/tmp/x.png") == {}
+        assert wh.capture_screen({"origin": "simulator", "session_id": "s1"}) == {}
+
+
+def datetime_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _sha256(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()

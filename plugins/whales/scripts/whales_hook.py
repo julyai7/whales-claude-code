@@ -45,6 +45,8 @@ closed from the server side by any transport choice.
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
 import json
 import os
 import re
@@ -381,6 +383,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def client_ts() -> str:
+    """When this machine sent the event, in UTC to the millisecond, stamped
+    on every event as ``raw_payload.client_ts``. The gateway otherwise orders
+    by arrival, and an event that waits on a screen upload can arrive after
+    the next turn's events; several edits can land in the same second."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def read_status() -> dict:
     """The last recorded upload outcome, or ``{}`` if nothing has been sent."""
     try:
@@ -548,7 +558,8 @@ def chunk_decision(failure: dict, start, now: float) -> str:
 def _chunk_body(source: str, session_key: str, session_id: str, transcript_path: str,
                 event_name: str, text: str, start, end, more_pending: bool) -> bytes:
     raw = {"hook_event_name": event_name, "whales_event": event_name,
-           "session_id": session_id, "transcript_path": transcript_path}
+           "session_id": session_id, "transcript_path": transcript_path,
+           "client_ts": client_ts()}
     _attach_transcript(raw, text, start, end, more_pending)
     return scrub(json.dumps({"source": source, "session_id": session_key,
                              "raw_payload": raw})).encode("utf-8")
@@ -581,7 +592,8 @@ def drain(url: str, token: str, session_id: str, transcript_path: str, source: s
 
 
 def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
-            transcript_path: str, chunk_start=None, lock=None, drain_to=None) -> None:
+            transcript_path: str, chunk_start=None, lock=None, drain_to=None,
+            screen=None) -> None:
     """Send one event, record the outcome, and only then move the offset.
 
     The offset is what says "these transcript bytes have been shipped".
@@ -597,8 +609,14 @@ def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
     lock, released here whatever happens. ``drain_to`` is
     ``(source, session_key)``: with it, an accepted upload goes on to ship
     the rest of the transcript.
+
+    ``screen`` is a screen to upload and stamp on the event first (see
+    ``screen_job``). Only the detached path passes it: an upload can take
+    seconds, and a hook must never hold the designer's turn.
     """
     try:
+        if screen:
+            body = with_screen(body, screen)
         ok, status, reason = _send(url, token, body)
         record_send_result(ok, status, reason)
         if chunk_start is not None:
@@ -616,7 +634,7 @@ def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
 
 def post_detached(url: str, token: str, body: bytes, session_id: str = "",
                   new_offset=None, transcript_path: str = "", chunk_start=None,
-                  lock=None, drain_to=None) -> None:
+                  lock=None, drain_to=None, screen=None) -> None:
     """Deliver in a detached grandchild so the hook returns immediately.
 
     Double-fork so the intermediate child exits at once and the grandchild is
@@ -648,9 +666,302 @@ def post_detached(url: str, token: str, body: bytes, session_id: str = "",
     except OSError:
         pass
     try:
-        deliver(*job)
+        deliver(*job, screen=screen)
     finally:
         os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Screens: what the designer saw, stitched to the turn that made it
+#
+# For native iOS apps the chat never holds the design: the agent edits
+# Swift, the designer builds and looks at it in the Simulator, and only a
+# screenshot they paste back ever reaches the chat. A capture of prompts and
+# diffs alone is the conversation without its artifact. Two screens close
+# that, each uploaded with the critique helper (the same content-hashed
+# ``source_id`` universal_critique takes) and stamped on its own capture as
+# ``whales_screen``, so the backend joins it to the turn:
+#
+# - pasted: a screenshot pasted into Cursor. Cursor saves it under
+#   ``~/.cursor/projects/<project>/assets/`` and reports the write through
+#   afterFileEdit, with no content. The helper sends the full-size original
+#   when it can find it, not Cursor's reduced copy.
+# - simulator: at the first prompt after a turn that edited iOS UI files,
+#   the booted Simulator's screen, stamped on that prompt with
+#   ``shows: "after_previous_turn"``. Not at Stop: designers often tell the
+#   agent not to build and rebuild once the turn is over, so the screen at
+#   Stop is usually the build from before the edit, and it would be filed as
+#   the edit's result. The next prompt is when the designer reacts to what is
+#   on screen. That can still be an older build, so the capture also carries
+#   when UI was last edited and when the newest app on the Simulator was
+#   installed; the reader decides.
+#
+# Only Swift, xib and storyboard edits ask for a Simulator screen: simctl is
+# the only capture there is, and after a web or Android edit it would read
+# whatever unrelated Simulator happens to be booted (or make macOS offer to
+# install the developer tools).
+#
+# WHALES_SCREENS=off turns both off; WHALES_CAPTURE=off already does.
+# ---------------------------------------------------------------------------
+
+SCREENS_DIR = os.path.join(CONFIG_DIR, "screens")
+_SIMULATOR_UI_SUFFIXES = (".swift", ".xib", ".storyboard")
+_SCREEN_UPLOAD_SECONDS = 90
+# Cursor reports one pasted image several times, from separate processes. The
+# first to claim the image (O_EXCL) uploads it and writes the result into the
+# claim; the others reuse that result. A claim still empty after this long
+# belongs to an upload that died and is taken over.
+_PASTE_CLAIM_STALE_SECONDS = 2 * _SCREEN_UPLOAD_SECONDS
+# A failed upload (a 403 while critique is off, an outage) is remembered too,
+# so every repeat does not retry it; after this long the next report does.
+_PASTE_RETRY_SECONDS = 3600
+# What the critique helper reports about an image worth keeping on the capture.
+_SCREEN_FIELDS = ("source_id", "filename", "width", "height", "size", "likely_downscaled",
+                  "original", "reduced_copy", "low_resolution", "original_too_large")
+
+
+def screens_on() -> bool:
+    return os.environ.get("WHALES_SCREENS", "").lower() not in ("0", "off", "false", "no")
+
+
+def _screen_state(session_id: str, suffix: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
+    return os.path.join(SCREENS_DIR, f"{safe}.{suffix}")
+
+
+def _event_path(event: dict) -> str:
+    tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    return str(event.get("file_path") or tool_input.get("file_path") or "")
+
+
+def pasted_screenshot(event: dict, event_name: str) -> str:
+    """The image a designer pasted into Cursor, if this event is its write."""
+    path = _event_path(event)
+    full = path.replace("\\", "/")
+    if (event_name == "PostToolUse" and path.lower().endswith(_IMAGE_SUFFIXES)
+            and "/.cursor/" in full and "/assets/" in full):
+        return path
+    return ""
+
+
+def note_ui_edit(event: dict, event_name: str, session_id: str) -> None:
+    """Remember that this session changed iOS UI source since its last screen."""
+    if event_name != "PostToolUse" or not session_id:
+        return
+    if not _event_path(event).lower().endswith(_SIMULATOR_UI_SUFFIXES):
+        return
+    try:
+        os.makedirs(SCREENS_DIR, exist_ok=True)
+        with open(_screen_state(session_id, "ui_edit"), "w") as fh:
+            fh.write(_now())
+    except OSError:
+        pass
+
+
+def take_ui_edit(session_id: str) -> str:
+    """When UI was last edited, if since the last screen; clears the mark."""
+    path = _screen_state(session_id, "ui_edit")
+    try:
+        with open(path) as fh:
+            at = fh.read().strip()
+        os.unlink(path)
+        return at
+    except OSError:
+        return ""
+
+
+def screen_job(event: dict, event_name: str, session_id: str):
+    """What screen, if any, this event should carry. Cheap: no upload here."""
+    if not screens_on() or not session_id:
+        return None
+    pasted = pasted_screenshot(event, event_name)
+    if pasted:
+        return {"origin": "pasted", "path": pasted, "session_id": session_id}
+    if event_name == "UserPromptSubmit":
+        edited_at = take_ui_edit(session_id)
+        if edited_at:
+            return {"origin": "simulator", "last_ui_edit_at": edited_at, "session_id": session_id}
+    return None
+
+
+def _upload_helper() -> str:
+    """The critique helper: beside this script (Cursor's ~/.whales/scripts),
+    in the plugin's universal-critique skill, or the installed copy."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "critique_source.py"),
+                 os.path.join(os.path.dirname(here), "skills", "universal-critique",
+                              "critique_source.py"),
+                 os.path.expanduser(_UPLOAD_HELPER)):
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def upload_screen(path: str) -> dict:
+    """Upload one image with the critique helper. Never raises."""
+    helper = _upload_helper()
+    if not helper:
+        return {"error": "the whales upload helper is not installed"}
+    try:
+        done = subprocess.run([sys.executable, helper, "upload", path], capture_output=True,
+                              text=True, timeout=_SCREEN_UPLOAD_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": f"upload did not run: {exc}"[:300]}
+    if done.returncode != 0:
+        return {"error": (done.stderr or done.stdout or "upload failed").strip()[:300]}
+    try:
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": "the upload helper printed no result"}
+    return {k: out[k] for k in _SCREEN_FIELDS if k in out}
+
+
+def _paste_claim_path(path: str) -> str:
+    """The claim file for this image, named by its content: Cursor reports
+    one paste under the same file each time."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return os.path.join(SCREENS_DIR, "pasted", digest.hexdigest())
+
+
+def claim_paste(claim: str):
+    """``(True, None)`` when this process now owns the image's upload, else
+    ``(False, what an earlier report recorded)`` — ``None`` while that upload
+    is still running. O_EXCL, as for the upload lock: two reports arriving
+    together must not both upload."""
+    os.makedirs(os.path.dirname(claim), exist_ok=True)
+    for _ in range(2):
+        try:
+            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return True, None
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(claim)
+                with open(claim) as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            try:
+                earlier = json.loads(text) if text.strip() else None
+            except ValueError:
+                earlier = None
+            if earlier is None and age < _PASTE_CLAIM_STALE_SECONDS:
+                return False, None
+            if isinstance(earlier, dict) and ("error" not in earlier or age < _PASTE_RETRY_SECONDS):
+                return False, earlier
+            try:
+                os.remove(claim)  # a dead upload's claim, or a failure old enough to retry
+            except OSError:
+                continue
+    return False, None
+
+
+def settle_paste(claim: str, info: dict) -> None:
+    """Write the upload's result, failure included, into its claim."""
+    try:
+        tmp = f"{claim}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(info, fh)
+        os.replace(tmp, claim)
+    except OSError:
+        pass
+
+
+def _newest_app(device: dict) -> dict:
+    """The app most recently installed on this Simulator and when. Says
+    whether a build after the last UI edit can be on screen, not that it is:
+    the foreground app may be another one."""
+    data = device.get("dataPath") or os.path.expanduser(
+        f"~/Library/Developer/CoreSimulator/Devices/{device.get('udid')}/data")
+    newest, at = "", 0.0
+    for app in glob.glob(os.path.join(data, "Containers", "Bundle", "Application", "*", "*.app")):
+        # The bundle's own entries too: a directory's mtime moves only when
+        # entries are added or removed, and a reinstall can rewrite the
+        # executable in place.
+        try:
+            with os.scandir(app) as entries:
+                mtime = max([os.path.getmtime(app)] + [e.stat().st_mtime for e in entries])
+        except OSError:
+            continue
+        if mtime > at:
+            newest, at = os.path.basename(app), mtime
+    if not newest:
+        return {}
+    when = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"newest_app": newest, "newest_app_installed_at": when}
+
+
+def simulator_screenshot(out_path: str) -> dict:
+    """Screenshot the booted iOS Simulator into ``out_path``. Never raises;
+    ``{}`` when there is no Simulator to read."""
+    if sys.platform != "darwin":
+        return {}
+    try:
+        listing = subprocess.run(["xcrun", "simctl", "list", "devices", "booted", "-j"],
+                                 capture_output=True, text=True, timeout=15)
+        devices = [d for runtime in json.loads(listing.stdout or "{}").get("devices", {}).values()
+                   for d in runtime if d.get("state") == "Booted"]
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return {}
+    if not devices:
+        return {}
+    device = devices[0]
+    try:
+        shot = subprocess.run(["xcrun", "simctl", "io", device["udid"], "screenshot", out_path],
+                              capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError, KeyError):
+        return {}
+    if shot.returncode != 0 or not os.path.isfile(out_path):
+        return {}
+    try:
+        app = _newest_app(device)
+    except Exception:  # noqa: BLE001 — a hint, never worth the screen
+        app = {}
+    return {"device": device.get("name"), "booted_devices": len(devices), **app}
+
+
+def capture_screen(job: dict) -> dict:
+    """Upload the job's screen; what to stamp on the event as ``whales_screen``."""
+    session_id = job.get("session_id", "")
+    if job["origin"] == "pasted":
+        path = job["path"]
+        claim = _paste_claim_path(path)
+        mine, earlier = claim_paste(claim)
+        if not mine:
+            # Another report of the same paste uploaded it (or is uploading
+            # it, and its own event will carry the screen).
+            return earlier or {}
+        info = {"origin": "pasted", "path": os.path.basename(path), **upload_screen(path)}
+        settle_paste(claim, info)
+        return info
+    os.makedirs(SCREENS_DIR, exist_ok=True)
+    out = _screen_state(session_id, f"sim-{int(time.time())}.png")
+    device = simulator_screenshot(out)
+    if not device:
+        return {}
+    info = {"origin": "simulator", "shows": "after_previous_turn", "taken_at": _now(),
+            "last_ui_edit_at": job.get("last_ui_edit_at"), **device, **upload_screen(out)}
+    try:
+        os.unlink(out)
+    except OSError:
+        pass
+    return info
+
+
+def with_screen(body: bytes, job: dict) -> bytes:
+    """``body`` with the job's screen stamped on its raw payload. Everything
+    else, ``client_ts`` included, was set before the screen work began."""
+    try:
+        info = capture_screen(job)
+        if not info:
+            return body
+        payload = json.loads(body)
+        payload["raw_payload"]["whales_screen"] = info
+        return scrub(json.dumps(payload)).encode("utf-8")
+    except Exception:  # noqa: BLE001 — a screen must never cost the event itself
+        return body
 
 
 def _send(url: str, token: str, body: bytes):
@@ -942,8 +1253,11 @@ def backfill(since: str, from_start: bool, projects_dir: str = "",
             text, new_offset, more_pending, start = transcript_delta(path, session_id)
             if not text:
                 break
+            # client_ts here is when the backfill shipped, not when the
+            # session happened; the transcript lines carry their own times.
             raw = {"hook_event_name": "Backfill", "whales_event": "Backfill",
-                   "session_id": session_id, "transcript_path": path}
+                   "session_id": session_id, "transcript_path": path,
+                   "client_ts": client_ts()}
             _attach_transcript(raw, text, start, new_offset, more_pending)
             body = scrub(json.dumps({
                 "source": "claude_code_hook",
@@ -1104,6 +1418,9 @@ def main() -> int:
         event = json.loads(raw_stdin) if raw_stdin.strip() else {}
     except (json.JSONDecodeError, OSError):
         event = {}
+    # Taken now, before anything slow: what orders this event against the
+    # session's others once it reaches the backend.
+    sent_at = client_ts()
 
     session_id = event.get("session_id") or event.get("conversation_id") or ""
 
@@ -1177,6 +1494,9 @@ def main() -> int:
                 except (TypeError, ValueError):
                     event[key] = str(event[key])
 
+    note_ui_edit(event, args.event, session_id)
+    screen = screen_job(event, args.event, session_id)
+
     session_key = f"{prefix}:{session_id}" if session_id else None
     payload = {
         "source": args.source,
@@ -1187,6 +1507,7 @@ def main() -> int:
     # payload says beforeSubmitPrompt / afterFileEdit, and the backend passes
     # read this to treat both hosts alike.
     payload["raw_payload"]["whales_event"] = args.event
+    payload["raw_payload"]["client_ts"] = sent_at
     # Both read the event before truncate() capped it: a long host preamble
     # can push the designer's own words past the cap.
     user_text = prompt_user_text(event.get("prompt"))
@@ -1205,10 +1526,17 @@ def main() -> int:
     # Otherwise the transcript rides along only with the session's upload
     # lock: an upload already in flight will drain what this event would have
     # sent, and sending it here too would ship it twice.
+    #
+    # An event carrying a screen never takes the lock either. Its detached
+    # process spends up to two minutes on simctl and the upload before it
+    # sends; holding the lock that long would delay the transcript and could
+    # outlive _LOCK_STALE_SECONDS, letting another hook take the lock over
+    # and ship the same range twice. Its transcript goes with the next event,
+    # as it does while the token is rejected.
     transcript_path = "" if args.event in _NO_TRANSCRIPT_EVENTS else event.get("transcript_path", "")
     text, new_offset, more_pending, start = "", None, False, None
     lock = None
-    if state != "rejected" and session_id and transcript_path:
+    if state != "rejected" and session_id and transcript_path and not screen:
         lock = acquire_upload_lock(session_id)
     if lock:
         text, new_offset, more_pending, start = transcript_delta(transcript_path, session_id)
@@ -1261,7 +1589,7 @@ def main() -> int:
     # the backend can never know about.
     post_detached(gateway_url(), token, body, session_id, new_offset, transcript_path,
                   chunk_start=start if text else None, lock=lock,
-                  drain_to=(args.source, session_key) if text else None)
+                  drain_to=(args.source, session_key) if text else None, screen=screen)
     return 0
 
 
