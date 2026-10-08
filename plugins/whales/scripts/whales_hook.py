@@ -1349,9 +1349,41 @@ def replace_old_cursor_wrapper() -> None:
         pass
 
 
+# Keep in step with whales_update.py's CHECK_INTERVAL. A cheap pre-check, so
+# most turns start no process; the updater checks again.
+_CHECK_INTERVAL = int(os.environ.get("WHALES_UPDATE_INTERVAL", "600"))
+
+
+def check_for_update() -> None:
+    """Claude Code, every turn: starts the updater when its last check is
+    older than _CHECK_INTERVAL. The plugin's SessionStart hook alone left a
+    session that stays open for days on the version it started with. The
+    installed plugin's updater, not this copy's, so an open session never
+    runs an older one. Returns at once; never raises."""
+    try:
+        try:
+            with open(os.path.join(CONFIG_DIR, "update_state.json")) as fh:
+                last = float(json.load(fh).get("last_check") or 0)
+        except (OSError, ValueError, AttributeError, TypeError):
+            last = 0.0
+        if time.time() - last < _CHECK_INTERVAL:
+            return
+        root = _installed_plugin_root()
+        updater = os.path.join(root, "scripts", "whales_update.py") if root else ""
+        if not updater or not os.path.isfile(updater):
+            updater = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whales_update.py")
+        subprocess.Popen([sys.executable, updater, "--session-start", "--host", "claude-code"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001 — the next turn tries again
+        pass
+
+
 def restart_notice(session_id: str):
     """Once per session, when the updater has installed a newer whales than
-    the one this session loaded: tell the designer (not the model) to restart.
+    the one this session loaded: tell the designer (not the model) how to
+    switch to it. /reload-plugins does that in the open session (verified on
+    Claude Code 2.1.294: the hooks run from the new installPath after it).
     Only for an installed copy: a --plugin-dir session is meant to differ."""
     here = os.path.dirname(os.path.abspath(__file__))
     if not session_id or f"{os.sep}plugins{os.sep}cache{os.sep}" not in here:
@@ -1375,8 +1407,8 @@ def restart_notice(session_id: str):
             fh.write(f"{session_id} {installed}")
     except OSError:
         return None
-    return {"systemMessage": f"whales {installed} is installed. Restart Claude Code to use it "
-                             f"(this session is on {running})."}
+    return {"systemMessage": f"whales {installed} is installed (this session is on {running}). "
+                             "Run /reload-plugins to use it now, or restart Claude Code."}
 
 
 def main() -> int:
@@ -1476,7 +1508,10 @@ def main() -> int:
                 f"token. Get a new install command from {new_token_page()} and run it."
             )
         print(json.dumps(out))
-    if args.event == "UserPromptSubmit" and args.source == "claude_code_hook":
+    if args.event in ("UserPromptSubmit", "Stop") and args.source == "claude_code_hook":
+        # At both ends of a turn: an update started by this prompt usually
+        # lands while the agent works, and Stop tells the designer then.
+        check_for_update()
         notice = restart_notice(session_id)
         if notice:
             print(json.dumps(notice))

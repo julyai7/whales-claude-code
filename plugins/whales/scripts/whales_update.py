@@ -7,8 +7,10 @@ Two things need updating, and nothing else updates them:
    Code's own auto-update only runs after the first prompt of an interactive
    session, then waits up to 10 minutes; idle sessions and `-p` runs never
    update. So this runs `claude plugin marketplace update` + `plugin update`
-   itself, at session start, in a detached process. The new version loads on
-   the next restart. Claude Code's own auto-update stays on: it is the
+   itself, in a detached process: at session start, and on every turn once
+   CHECK_INTERVAL has passed, so a session left open for days still gets a
+   release. The open session loads it when the designer acts on the capture
+   hook's notice. Claude Code's own auto-update stays on: it is the
    independent way back if a release ever breaks this file.
 
 2. **The files outside the plugin**, in ~/.whales and the hosts' configs.
@@ -30,7 +32,10 @@ Two things need updating, and nothing else updates them:
 
 Modes:
   --session-start --host claude-code|cursor
-      What the hooks call. Returns at once and prints nothing (Claude Code
+      What the hooks call: at session start, and on later events once
+      CHECK_INTERVAL has passed (the capture hook and the Cursor wrapper
+      check that first, so most events start no process). Returns at once
+      and prints nothing (Claude Code
       feeds SessionStart stdout to the model): it starts ``--run`` in a
       detached process, at most once per CHECK_INTERVAL.
   --run [--host H] [--force]

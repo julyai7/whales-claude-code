@@ -94,10 +94,35 @@ class TestWrapper:
         assert _wait(ran.exists)
         assert ran.read_text().split()[0] == str(home / ".whales" / "scripts" / "whales_update.py")
 
-    def test_other_events_start_no_update(self, home):
+    def test_any_event_starts_the_update_once_due(self, home):
+        """A chat left open for days still gets a release: the next event in
+        it runs the new capture_hook.py from disk."""
+        then = time.time() - 601  # and succeeding: no recovery download
+        (home / ".whales" / "update_state.json").write_text(json.dumps({"last_check": then, "last_success": then}))
         _wrapper(home, "--event", "Stop", "--source", "cursor_hook")
+        ran = home / "updater_ran"
+        assert _wait(ran.exists)
+        assert "--session-start --host cursor" in ran.read_text()
+
+    def test_no_update_within_the_interval(self, home):
+        (home / ".whales" / "update_state.json").write_text(json.dumps({"last_check": time.time() - 60}))
+        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+            _wrapper(home, "--event", event, "--source", "cursor_hook")
         time.sleep(0.5)
         assert not (home / "updater_ran").exists()
+
+    def test_never_on_the_tool_call_hooks(self, home):
+        """Run on every tool call with a 5-second timeout."""
+        for event in ("PreToolUse", "DesignContext"):
+            _wrapper(home, "--event", event, "--source", "cursor_hook")
+        time.sleep(0.5)
+        assert not (home / "updater_ran").exists()
+
+    def test_an_unreadable_state_file_counts_as_due(self, home):
+        (home / ".whales" / "update_state.json").write_text("[1, 2")
+        r = _wrapper(home, "--event", "UserPromptSubmit", "--source", "cursor_hook")
+        assert r.returncode == 0
+        assert _wait((home / "updater_ran").exists)
 
     def test_install_hooks_flag_still_works(self, home):
         """What the installer called on the wrapper it wrote."""
@@ -170,9 +195,9 @@ class TestRestartNotice:
         manifest.write_text(json.dumps(data))
         return root
 
-    def _prompt(self, home: Path, root: Path, session: str = "s1") -> str:
+    def _prompt(self, home: Path, root: Path, session: str = "s1", event: str = "UserPromptSubmit") -> str:
         r = subprocess.run([sys.executable, str(root / "scripts" / "whales_hook.py"),
-                            "--event", "UserPromptSubmit"],
+                            "--event", event],
                            input=json.dumps({"session_id": session, "prompt": "hi"}),
                            capture_output=True, text=True, env=_env(home), timeout=30)
         return r.stdout.strip()
@@ -185,7 +210,7 @@ class TestRestartNotice:
         running = self._cache(tmp_path, "0.6.0")
         self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
         out = json.loads(self._prompt(tmp_path, running))
-        assert "whales 0.6.1 is installed. Restart Claude Code" in out["systemMessage"]
+        assert out["systemMessage"].startswith("whales 0.6.1 is installed (this session is on 0.6.0). Run /reload-plugins")
         assert self._prompt(tmp_path, running) == ""
         assert self._prompt(tmp_path, running, session="s2") != ""
 
@@ -197,6 +222,57 @@ class TestRestartNotice:
     def test_nothing_for_a_plugin_dir_session(self, tmp_path):
         self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
         assert self._prompt(tmp_path, PLUGIN) == ""
+
+    def test_also_at_the_end_of_a_turn(self, tmp_path):
+        """An update the prompt started usually lands while the agent works."""
+        running = self._cache(tmp_path, "0.6.0")
+        self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
+        out = json.loads(self._prompt(tmp_path, running, event="Stop"))
+        assert "/reload-plugins" in out["systemMessage"]
+        assert self._prompt(tmp_path, running) == ""
+
+
+class TestClaudeCodeCheckEveryTurn:
+    """A Claude Code session open for days: each turn starts the updater once
+    its last check is older than the interval, using the INSTALLED plugin's
+    updater (the running copy may be the old one)."""
+
+    def _hook(self, home: Path, root: Path, event: str):
+        return subprocess.run([sys.executable, str(root / "scripts" / "whales_hook.py"), "--event", event],
+                              input=json.dumps({"session_id": "s1"}), capture_output=True, text=True,
+                              env=_env(home), timeout=30)
+
+    @pytest.fixture
+    def machine(self, tmp_path):
+        running = TestRestartNotice()._cache(tmp_path, "0.5.1")
+        installed = _installed_plugin(tmp_path)  # 0.6.0, with the stub updater
+        return tmp_path, running, installed
+
+    @pytest.mark.parametrize("event", ["UserPromptSubmit", "Stop"])
+    def test_starts_the_installed_updater_when_due(self, machine, event):
+        home, running, installed = machine
+        (home / ".whales").mkdir()
+        (home / ".whales" / "update_state.json").write_text(json.dumps({"last_check": time.time() - 601}))
+        assert self._hook(home, running, event).returncode == 0
+        ran = home / "updater_ran"
+        assert _wait(ran.exists)
+        assert ran.read_text().split()[0] == str(installed / "scripts" / "whales_update.py")
+        assert "--session-start --host claude-code" in ran.read_text()
+
+    def test_nothing_within_the_interval(self, machine):
+        home, running, _ = machine
+        (home / ".whales").mkdir()
+        (home / ".whales" / "update_state.json").write_text(json.dumps({"last_check": time.time() - 60}))
+        self._hook(home, running, "UserPromptSubmit")
+        time.sleep(0.5)
+        assert not (home / "updater_ran").exists()
+
+    @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse", "PreCompact"])
+    def test_nothing_on_other_events(self, machine, event):
+        home, running, _ = machine
+        self._hook(home, running, event)
+        time.sleep(0.5)
+        assert not (home / "updater_ran").exists()
 
 
 class TestRecoveringFromABrokenUpdater:
@@ -231,7 +307,7 @@ class TestRecoveringFromABrokenUpdater:
     def test_fetches_a_fresh_updater_after_days_of_failures(self, home, server):
         (home / ".whales" / "plugin_source").write_text(server)
         now = time.time()
-        self._state(home, last_check=now - 60, last_success=now - 4 * 86400)
+        self._state(home, last_check=now - 601, last_success=now - 4 * 86400)
         _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
         assert _wait((home / "fresh_updater_ran").exists)
         state = json.loads((home / ".whales" / "update_state.json").read_text())
@@ -240,7 +316,7 @@ class TestRecoveringFromABrokenUpdater:
     def test_leaves_a_working_updater_alone(self, home, server):
         (home / ".whales" / "plugin_source").write_text(server)
         now = time.time()
-        self._state(home, last_check=now - 60, last_success=now - 3600)
+        self._state(home, last_check=now - 601, last_success=now - 3600)
         _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
         assert _wait((home / "updater_ran").exists)
         assert not (home / "fresh_updater_ran").exists()
@@ -250,7 +326,7 @@ class TestRecoveringFromABrokenUpdater:
         _installed_plugin(home)
         (home / ".whales" / "plugin_source").write_text(server)
         now = time.time()
-        self._state(home, last_check=now - 60, last_success=now - 4 * 86400)
+        self._state(home, last_check=now - 601, last_success=now - 4 * 86400)
         _wrapper(home, "--event", "SessionStart", "--source", "cursor_hook")
         assert _wait((home / "updater_ran").exists)
         assert not (home / "fresh_updater_ran").exists()

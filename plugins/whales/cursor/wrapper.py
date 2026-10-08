@@ -8,8 +8,12 @@ which is what exit code 2 means to it. So it always exits 0.
 
 1. Runs capture_hook.py (beside this file) with the same arguments and input,
    so edits made with Cursor's own tools reach whales.
-2. On a session start, starts the updater, which checks for a new whales at
-   most every few minutes in a detached process. It prefers the updater
+2. Starts the updater, which checks for a new whales in a detached process,
+   at most once per CHECK_INTERVAL. On any event, not just a session start:
+   a chat left open for days must still pick up a release, and since this
+   runs capture_hook.py from disk each time, the open chat uses the new one
+   from its next event. Never on preToolUse or postToolUse (DesignContext),
+   which run on every tool call with a short timeout. It prefers the updater
    inside the installed Claude Code plugin over the copy beside this file:
    that way a release can fix a broken copy here. Designers without Claude
    Code only have the copy here, so when it has not succeeded for days, a
@@ -36,6 +40,11 @@ STATE_FILE = os.path.join(CONFIG_DIR, "update_state.json")
 SOURCE_FILE = os.path.join(CONFIG_DIR, "plugin_source")
 DEFAULT_SOURCE = "https://raw.githubusercontent.com/julyai7/whales-claude-code/main/plugins/whales"
 RECOVER_AFTER = 3 * 86400
+# Keep in step with whales_update.py's CHECK_INTERVAL: this is only a cheap
+# pre-check so most events start no process; the updater checks again.
+CHECK_INTERVAL = int(os.environ.get("WHALES_UPDATE_INTERVAL", "600"))
+# The tool-call hooks: frequent, and a 5-second timeout.
+NO_CHECK_EVENTS = ("PreToolUse", "DesignContext")
 
 
 def _updater() -> str:
@@ -83,6 +92,15 @@ def _recover(updater: str) -> None:
     os.replace(updater + ".tmp", updater)
 
 
+def _due() -> bool:
+    try:
+        with open(STATE_FILE) as fh:
+            last = float(json.load(fh).get("last_check") or 0)
+    except (OSError, ValueError, AttributeError, TypeError):
+        last = 0.0
+    return time.time() - last >= CHECK_INTERVAL
+
+
 def _start_update() -> None:
     updater = _updater()
     if not os.path.isfile(updater):
@@ -106,7 +124,7 @@ def main(args: list[str]) -> None:
         r = subprocess.run([sys.executable, _updater(), "--install-cursor-hooks", spec])
         sys.exit(r.returncode)
     try:
-        if args[args.index("--event") + 1] == "SessionStart":
+        if args[args.index("--event") + 1] not in NO_CHECK_EVENTS and _due():
             _start_update()
     except (ValueError, IndexError, OSError):
         pass
