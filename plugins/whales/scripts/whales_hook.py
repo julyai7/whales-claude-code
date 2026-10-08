@@ -1383,7 +1383,8 @@ def restart_notice(session_id: str):
     """Once per session, when the updater has installed a newer whales than
     the one this session loaded: tell the designer (not the model) how to
     switch to it. /reload-plugins does that in the open session (verified on
-    Claude Code 2.1.294: the hooks run from the new installPath after it).
+    Claude Code 2.1.294, interactive and -p, with a changed skill: no --force
+    asked, and the hooks run from the new installPath after it).
     Only for an installed copy: a --plugin-dir session is meant to differ."""
     here = os.path.dirname(os.path.abspath(__file__))
     if not session_id or f"{os.sep}plugins{os.sep}cache{os.sep}" not in here:
@@ -1398,13 +1399,26 @@ def restart_notice(session_id: str):
         return None
     if not running or not installed or running == installed:
         return None
-    marker = os.path.join(CONFIG_DIR, "restart_notice")
-    if _read(marker) == f"{session_id} {installed}":
+    # Which version each session was told about. Per session: with one shared
+    # value, two open sessions would each re-arm the other's notice.
+    marker = os.path.join(CONFIG_DIR, "update_notices.json")
+    try:
+        with open(marker) as fh:
+            told = json.load(fh)
+        if not isinstance(told, dict):
+            told = {}
+    except (OSError, ValueError):
+        told = {}
+    if told.get(session_id) == installed:
         return None
+    told.pop(session_id, None)
+    told[session_id] = installed
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(marker, "w") as fh:
-            fh.write(f"{session_id} {installed}")
+        tmp = f"{marker}.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(dict(list(told.items())[-20:]), fh)
+        os.replace(tmp, marker)
     except OSError:
         return None
     return {"systemMessage": f"whales {installed} is installed (this session is on {running}). "

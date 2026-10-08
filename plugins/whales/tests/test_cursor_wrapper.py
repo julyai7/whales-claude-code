@@ -223,6 +223,21 @@ class TestRestartNotice:
         self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
         assert self._prompt(tmp_path, PLUGIN) == ""
 
+    def test_two_open_sessions_are_each_told_once(self, tmp_path):
+        running = self._cache(tmp_path, "0.6.0")
+        self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
+        assert self._prompt(tmp_path, running, session="a", event="Stop") != ""
+        assert self._prompt(tmp_path, running, session="b") != ""
+        assert self._prompt(tmp_path, running, session="a") == ""
+        assert self._prompt(tmp_path, running, session="b", event="Stop") == ""
+
+    def test_told_again_about_a_later_version(self, tmp_path):
+        running = self._cache(tmp_path, "0.6.0")
+        self._install(tmp_path, self._cache(tmp_path, "0.6.1"), "0.6.1")
+        assert self._prompt(tmp_path, running) != ""
+        self._install(tmp_path, self._cache(tmp_path, "0.6.2"), "0.6.2")
+        assert "0.6.2" in self._prompt(tmp_path, running)
+
     def test_also_at_the_end_of_a_turn(self, tmp_path):
         """An update the prompt started usually lands while the agent works."""
         running = self._cache(tmp_path, "0.6.0")
