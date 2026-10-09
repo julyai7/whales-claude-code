@@ -38,9 +38,12 @@ what it leaves out.
 
 ## Updates: the installer runs once
 
-`scripts/whales_update.py` runs at every session start, in Claude Code (its
-own SessionStart hook) and in Cursor (the wrapper below). In a detached
-process, at most every 10 minutes, it:
+`scripts/whales_update.py` runs at every session start, and again during a
+session once 10 minutes have passed since its last check, so a chat left open
+for days still gets a release. In Claude Code: its own SessionStart hook, then
+the capture hook on every prompt and end of turn. In Cursor: the wrapper below,
+on every event except the tool-call ones. In a detached process, at most every
+10 minutes, it:
 
 1. runs `claude plugin marketplace update whales` and, when the catalog lists
    a different version, `claude plugin update whales@whales`. Different, not
@@ -52,15 +55,19 @@ process, at most every 10 minutes, it:
    whales' entries in `~/.cursor/hooks.json`, the version header in
    `~/.cursor/mcp.json`, and the allow rules above.
 
-A new version loads when Claude Code or Cursor restarts; the next prompt in a
-session still on the old one says so. Claude Code's own auto-update stays on
-as a second way in if a release ever breaks the updater. Machines without
-Claude Code fetch the same files from this repo's `main`.
+In Cursor, an open chat runs the new capture hook from its next event: the
+wrapper runs `capture_hook.py` from disk each time. Skills and the MCP entry
+load when Cursor restarts. In Claude Code, an open session keeps the version it
+loaded until `/reload-plugins` or a restart; at the end of that turn or the
+next prompt, the capture hook tells the designer so. Claude Code's own
+auto-update stays on as a second way in if a release ever breaks the updater.
+Machines without Claude Code fetch the same files from this repo's `main`.
 
 **Releasing is merging a version bump to `main`.** Every installed machine
-picks it up at its next session start. Updates follow the published version
-**down** as well as up, so a plugin PR must bump *above whatever `main` has at
-merge time*: a branch cut before someone else's release, merged as is, rolls
+picks it up at its first prompt or event once 10 minutes have passed since
+its last check (0.6.5 and later; older ones at their next session start).
+Updates follow the published version **down** as well as up, so a plugin PR
+must bump *above whatever `main` has at merge time*: a branch cut before someone else's release, merged as is, rolls
 every designer back. Never below 0.6.0, the first version that updates itself
 (`tests/test_whales_update.py` checks that floor). There are no channels yet (JUL-652
 Phase 2), so test a release before merging: point your own install at the
@@ -179,8 +186,9 @@ Cursor events**:
 
 Each entry runs `~/.whales/scripts/whales_hook.py`, the plugin's
 `cursor/wrapper.py` copied there by the updater. It runs `capture_hook.py`
-(this plugin's `whales_hook.py`, copied beside it) and, on a session start,
-the updater — the installed plugin's copy when there is one, so a release can
+(this plugin's `whales_hook.py`, copied beside it) and, once 10 minutes have
+passed since the last check (never on `preToolUse` or `postToolUse`), the
+updater — the installed plugin's copy when there is one, so a release can
 fix a broken copy in `~/.whales`. A Cursor-only machine whose updater has not
 succeeded for three days downloads a fresh one first.
 
