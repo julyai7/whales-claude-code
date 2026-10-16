@@ -16,7 +16,16 @@ the file itself travels:
         sends the given file as is. For a page it first bundles everything the page
         loads from this machine (images, stylesheets, scripts, fonts) into
         the one file it sends, and prints what it bundled, what it could not
-        find, and how many internet references it left as they are.
+        find, and how many internet references it left as they are. That
+        bundled page is also saved beside the original, as
+        `<name>.standalone.html` (`standalone`): the copy to hand the
+        designer, since it opens on its own.
+
+    critique_source.py bundle <page> [--out PATH]
+        Writes that self-contained copy of a page without uploading it, and
+        prints its path. The Claude app, a browser tab opened from a chat or a
+        file sent to someone shows a page alone, without the files beside it:
+        a page that loads `assets/map.png` shows no map there.
 
     critique_source.py fetch <critique_id> <index> [--out PATH]
         Downloads the exact image a critique ran on (screen `index` from the
@@ -527,6 +536,44 @@ def bundle_page(path: str) -> tuple[bytes, dict]:
                      "external": bundle.external}
 
 
+def standalone_path(path: str) -> str:
+    """Where a page's self-contained copy goes: beside it, `<name>.standalone.html`."""
+    stem, _ = os.path.splitext(path)
+    if stem.endswith(".standalone"):
+        stem = stem[: -len(".standalone")]
+    return f"{stem}.standalone.html"
+
+
+def write_standalone(path: str, content: bytes, out: str | None = None) -> str | None:
+    """Save a bundled page so the designer opens the same page whales checked: the Claude app's pane, a chat's
+    browser tab and a file sent on all show a page without its neighbouring files (JUL-869: Ruolan's rebuilt
+    DoorDash page showed no map or icons, though the copy whales checked had all six). The original is never
+    touched; a page that is its own copy already is not written again."""
+    target = os.path.abspath(os.path.expanduser(out or standalone_path(path)))
+    if target == os.path.abspath(path):
+        return target
+    try:
+        with open(target, "wb") as fh:
+            fh.write(content)
+    except OSError:
+        return None
+    return target
+
+
+def bundle(path: str, out: str | None = None) -> None:
+    path = os.path.expanduser(path)
+    if not path.lower().endswith(_PAGE_SUFFIXES):
+        _fail(f"{os.path.basename(path)} is not an HTML page; only a page loads other files.")
+    try:
+        content, report = bundle_page(path)
+    except OSError as exc:
+        _fail(f"Could not read {path}: {exc}")
+    target = write_standalone(path, content, out)
+    if target is None:
+        _fail(f"Could not write the self-contained copy of {path}.")
+    print(json.dumps({"status": "ok", "standalone": target, "bytes": len(content), **report}))
+
+
 def upload(path: str, exact: bool = False) -> None:
     path = os.path.expanduser(path)
     report: dict = {}
@@ -579,6 +626,9 @@ def upload(path: str, exact: bool = False) -> None:
     result = json.loads(body)
     result["filename"] = os.path.basename(path)
     result.update(report)
+    if path.lower().endswith(_PAGE_SUFFIXES):
+        # The page whales checked, kept for the designer: the same bytes, so what they open is what passed.
+        result["standalone"] = write_standalone(path, content)
     print(json.dumps(result))
 
 
@@ -774,6 +824,9 @@ def main() -> None:
     fe.add_argument("critique_id")
     fe.add_argument("index", type=int)
     fe.add_argument("--out")
+    bu = sub.add_parser("bundle", help="write a page's self-contained copy, for opening on its own")
+    bu.add_argument("path")
+    bu.add_argument("--out", help="where to write it (default: <name>.standalone.html beside the page)")
     co = sub.add_parser("compare", help="show a screen and its rebuild side by side")
     co.add_argument("before")
     co.add_argument("after")
@@ -785,6 +838,8 @@ def main() -> None:
         upload(args.path, args.exact)
     elif args.command == "fetch":
         fetch(args.critique_id, args.index, args.out)
+    elif args.command == "bundle":
+        bundle(args.path, args.out)
     else:
         compare(args.before, args.after, args.out, args.width)
 
