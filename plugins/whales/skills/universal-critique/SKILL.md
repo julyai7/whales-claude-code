@@ -143,8 +143,10 @@ either tool.
    modify the designer's own files (the page, its stylesheets, its images)
    unless they ask you to in so many words: the original is what they compare
    the rebuild against, and what a later critique should run on.
-6. Upload the rebuilt file with `critique_source.py upload`,
-   and call `self_critique` with the `source_id` it prints, the same
+6. Upload the rebuilt file with `critique_source.py upload`. For a page it
+   also saves a self-contained copy beside it, `standalone` in what it
+   prints, with every image, stylesheet and font built in. Call
+   `self_critique` with the `source_id` it prints, the same
    `critique_id`, and — when the critique had several screens (`renders`) —
    the `screen` index you rebuilt. Fix every violation it reports, save,
    upload again and call it again: at most three rounds. A page that has
@@ -156,7 +158,11 @@ either tool.
    python3 critique_source.py compare "<before>" "<rebuilt file>"
    ```
    Open the `png` it prints. On Cursor, open the PNG, not the HTML file — that
-   opens its source, and it reads as if nothing was generated. If `png` is
+   opens its source, and it reads as if nothing was generated. When you name
+   or open the rebuilt page itself, it is the `standalone` file from the last
+   upload: the Claude app, a browser tab and a file sent to a teammate show a
+   page alone, so one that loads images from beside it shows none of them
+   (`critique_source.py bundle <page>` writes that copy for any page). If `png` is
    null (no Chrome-family browser was found), open the PNG of the rebuilt
    page instead and give the comparison's `html` path.
 
