@@ -128,15 +128,16 @@ either tool.
      python3 critique_source.py fetch <critique_id> <index>
      ```
      Don't take a fresh screenshot — a live page can have changed since.
-3. The critiqued screen wins wherever you keep it. When the contract has a
-   **"How this designer works"** section, use it for every choice the source
-   doesn't settle (an element you add or restructure, a fix, a spacing or a
-   shape you have to pick). When the designer asks for their own style ("in
-   my style", "my favourite design style", "make it feel like mine"), apply
-   that section across the whole screen: that is the restyle they asked for.
-   If the contract has no such section and they ask for their style, call
-   `get_design_profile` for it. Otherwise don't restyle the screen into their
-   conventions.
+3. When the contract has a **"How this designer works"** section, the
+   rebuild is in their style whether or not they asked ("in my style" only
+   says what is already the case): apply that section across the whole
+   screen, as the contract's "Their style, the source's identity" says. Their
+   look (spacing, corner shape, type tiers, colour restraint, surface) replaces
+   the source's; the screen keeps its identity (its name and logo, wording,
+   imagery, typefaces, icon set, content and structure). If the contract has no
+   such section and they ask for their style, call `get_design_profile` for it.
+   Otherwise the critiqued screen wins wherever you keep it: don't restyle it
+   into their conventions.
 4. Don't call `submit_design` for this rebuild.
 5. Write the rebuild as **new files** beside the original — for example
    `index.whales.html`, and a new stylesheet if the styles change. Never
