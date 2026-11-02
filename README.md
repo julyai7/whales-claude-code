@@ -140,6 +140,16 @@ improves from real work. Specifics:
   rejected token is also shown to the designer directly. The first upload
   after an outage carries a `capture_health` count of the events that did not
   get through.
+- **Claude Code's memory notes, whole.** Claude Code keeps notes about how
+  the designer works in `~/.claude/projects/<project>/memory/` (`MEMORY.md`
+  and one file per lesson). At session start, after each turn and at session
+  end, the hook sends every note whose content changed since whales last
+  accepted one, plus the name and hash of every note there, so whales holds
+  them and can serve them to the designer's rebuilds (`get_designer_notes`).
+  Only for a project where whales tools have been used
+  (`~/.whales/memory_projects.json`); other projects' memory is never read.
+  What was accepted is tracked under `~/.whales/memory/`, so an unchanged
+  folder sends nothing. `export WHALES_MEMORY=off` turns this off alone.
 - **Off switch:** `export WHALES_CAPTURE=off`. To stop entirely,
   `claude plugin uninstall whales` and delete `~/.whales/`.
 
