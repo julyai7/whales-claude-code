@@ -821,16 +821,46 @@ def memory_snapshot_bodies(project: str, files: dict, sent: dict, session_key, s
     return bodies
 
 
+# A gateway that took the snapshot without saying it stored the notes (a
+# backend from before it held them) is asked again after this long, not on
+# every turn.
+_MEMORY_UNCONFIRMED_RETRY_SECONDS = 3600
+
+
+def _send_snapshot(url: str, token: str, body: bytes):
+    """POST one snapshot part. ``(ok, status, reason, stored)``: ``stored`` is
+    whether the answer says whales stored the notes (``memory_notes_stored``).
+    A 2xx alone is not enough: a backend that does not hold notes yet answers
+    200 and keeps nothing, and a snapshot marked sent is never sent again."""
+    request = urllib.request.Request(
+        f"{url}/hooks/ingest", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            try:
+                answer = json.loads(response.read(65536) or b"{}")
+            except ValueError:
+                answer = {}
+            return True, response.status, "", isinstance(answer, dict) and "memory_notes_stored" in answer
+    except urllib.error.HTTPError as exc:
+        return False, exc.code, str(exc.reason or ""), False
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        return False, None, str(getattr(exc, "reason", "") or exc), False
+
+
 def send_memory_snapshot(event: dict, token: str, session_key, sent_at: str) -> None:
     """Snapshot the session's project memory when whales is used there and something changed. Detached; the state
-    moves only once every upload was accepted, so a failure is re-sent at the next event."""
+    moves only once every part was stored, so a failure is re-sent at the next event."""
     project, memory_dir = memory_location(event)
     if not project or not os.path.isdir(memory_dir) or project not in _read_json(MEMORY_PROJECTS_FILE, []):
         return
     state_path = _memory_state_path(project)
+    state = _read_json(state_path, {})
+    if time.time() - float(state.get("unconfirmed_at") or 0) < _MEMORY_UNCONFIRMED_RETRY_SECONDS:
+        return
     files = read_memory(memory_dir)
-    bodies = memory_snapshot_bodies(project, files, _read_json(state_path, {}).get("manifest", {}),
-                                    session_key, sent_at)
+    bodies = memory_snapshot_bodies(project, files, state.get("manifest", {}), session_key, sent_at)
     if not bodies:
         return
     manifest = {name: digest for name, (_text, digest, _mtime) in files.items()}
@@ -838,9 +868,12 @@ def send_memory_snapshot(event: dict, token: str, session_key, sent_at: str) -> 
     def work():
         url = gateway_url()
         for body in bodies:
-            ok, status, reason = _send(url, token, body)
+            ok, status, reason, stored = _send_snapshot(url, token, body)
             record_send_result(ok, status, reason)
             if not ok:
+                return
+            if not stored:
+                _write_json(state_path, {**state, "unconfirmed_at": time.time()})
                 return
         _write_json(state_path, {"project": project, "manifest": manifest})
 

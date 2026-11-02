@@ -116,9 +116,10 @@ def test_only_a_project_where_whales_was_used_is_snapshotted(home, monkeypatch):
 
 
 class _Gateway:
-    """A local gateway that keeps every body it gets and answers ``status``."""
+    """A local gateway that keeps every body it gets and answers ``status`` with ``answer``."""
 
-    def __init__(self, status=200):
+    def __init__(self, status=200, answer=None):
+        answer = {"status": "captured", "memory_notes_stored": 2} if answer is None else answer
         self.bodies = []
         outer = self
 
@@ -126,8 +127,11 @@ class _Gateway:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
                 outer.bodies.append(json.loads(self.rfile.read(length)))
+                data = json.dumps(answer).encode()
                 self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
+                self.wfile.write(data)
 
             def log_message(self, *a):
                 pass
@@ -198,3 +202,26 @@ def test_end_to_end_off_switch(home):
     _run_hook("Stop", ev, home, env={"WHALES_MEMORY": "off"})
     time.sleep(0.5)
     assert gateway.snapshots(timeout=0.3) == []
+
+
+def test_end_to_end_a_backend_that_does_not_store_notes_is_not_counted_and_is_asked_again_later(home):
+    """A 200 from a backend that predates the notes table must not mark the folder sent: nothing would ever send it
+    again. It is asked again after an hour, not on every turn."""
+    gateway = _Gateway(answer={"status": "captured"})
+    _connect(home, gateway)
+    ev = _event(home)
+    _run_hook("PreToolUse", {**ev, "tool_name": "mcp__whales__whales", "tool_input": {}}, home)
+    _run_hook("Stop", ev, home)
+    assert len(gateway.snapshots()) == 1
+    deadline = time.time() + 5
+    while not list((home / ".whales" / "memory").glob("*.json")) and time.time() < deadline:
+        time.sleep(0.02)
+    [state_file] = list((home / ".whales" / "memory").glob("*.json"))
+    state = json.loads(state_file.read_text())
+    assert "manifest" not in state and state["unconfirmed_at"]
+    _run_hook("Stop", ev, home)
+    time.sleep(0.5)
+    assert len(gateway.snapshots(want=2, timeout=0.3)) == 1, "not re-sent within the hour"
+    state_file.write_text(json.dumps({"unconfirmed_at": time.time() - 4000}))
+    _run_hook("Stop", ev, home)
+    assert len(gateway.snapshots(want=2)) == 2
