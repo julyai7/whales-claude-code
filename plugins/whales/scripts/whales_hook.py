@@ -643,14 +643,25 @@ def post_detached(url: str, token: str, body: bytes, session_id: str = "",
     back to a short blocking send, which is still bounded by the timeout.
     """
     job = (url, token, body, session_id, new_offset, transcript_path, chunk_start, lock, drain_to)
+    run_detached(lambda: deliver(*job, screen=screen), fallback=lambda: deliver(*job))
+
+
+def run_detached(work, fallback=None) -> None:
+    """Run ``work`` in a detached grandchild and return at once.
+
+    Double-fork so the intermediate child exits at once and the grandchild is
+    reparented to init. Without fork, ``fallback`` (or ``work``) runs here,
+    still bounded by the send timeout.
+    """
+    fallback = fallback or work
     if not hasattr(os, "fork"):
-        deliver(*job)
+        fallback()
         return
     try:
         if os.fork() != 0:
             return  # parent: done, hook exits now; the grandchild owns the lock
     except OSError:
-        deliver(*job)
+        fallback()
         return
     try:
         os.setsid()
@@ -666,9 +677,207 @@ def post_detached(url: str, token: str, body: bytes, session_id: str = "",
     except OSError:
         pass
     try:
-        deliver(*job, screen=screen)
+        work()
     finally:
         os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Memory: the notes Claude Code keeps about how the designer works
+#
+# Claude Code's auto-memory writes one markdown file per lesson into
+# ``~/.claude/projects/<project>/memory/`` (a rule from a correction, a
+# precedent from an approval) and an index, MEMORY.md, it loads into every
+# session. For a designer those notes are their style, learned rebuild by
+# rebuild, and they were only on this machine. Edit capture sees a note only
+# when Claude changes it with Write or Edit, and an Edit carries just the
+# changed lines: a note written before the hook existed, or changed with Bash
+# or by hand, never reached whales whole. Ruolan's MEMORY.md was 16 edits and
+# no whole file, so whales could not rebuild it at all.
+#
+# So the folder itself is sent: at session start, after each turn and at
+# session end, every note whose content changed since the last accepted
+# snapshot, plus the name and hash of every note there (so a deleted note is
+# marked deleted). Only for a project where whales tools have been used
+# (``~/.whales/memory_projects.json``, marked on the first whales tool call):
+# memory from the designer's unrelated projects never leaves the machine.
+# Whole files, not capped like edit fields: an index cut short is worse than
+# none. WHALES_MEMORY=off turns this off; WHALES_CAPTURE=off already does.
+# ---------------------------------------------------------------------------
+
+MEMORY_PROJECTS_FILE = os.path.join(CONFIG_DIR, "memory_projects.json")
+MEMORY_STATE_DIR = os.path.join(CONFIG_DIR, "memory")
+_MEMORY_EVENTS = ("SessionStart", "Stop", "SessionEnd")
+# A bound, far above any real note (the largest seen is a 16.6 KB index). A
+# bigger file is listed in the manifest but its content is not sent.
+_MAX_MEMORY_FILE_CHARS = 200_000
+# Most content per upload; a larger change goes in several.
+_MAX_MEMORY_BODY_CHARS = 1_000_000
+
+
+def memory_on() -> bool:
+    return os.environ.get("WHALES_MEMORY", "").lower() not in ("0", "off", "false", "no")
+
+
+def memory_location(event: dict):
+    """``(project, memory_dir)`` for the session's project, or ``("", "")``.
+
+    The project folder is the one the session's transcript lives in
+    (``~/.claude/projects/<project>/<session>.jsonl``), whatever the project
+    is called: a desktop-app scratch workspace has its own. Falls back to the
+    folder Claude Code derives from ``cwd``.
+    """
+    transcript = event.get("transcript_path") or ""
+    if transcript:
+        base = os.path.dirname(transcript)
+    elif event.get("cwd"):
+        base = project_transcript_dir(event["cwd"], os.path.expanduser("~/.claude/projects"))
+    else:
+        return "", ""
+    if os.path.basename(os.path.dirname(base)) != "projects":
+        return "", ""
+    return os.path.basename(base), os.path.join(base, "memory")
+
+
+def _read_json(path: str, default):
+    try:
+        with open(path) as fh:
+            value = json.load(fh)
+        return value if isinstance(value, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: str, value) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            json.dump(value, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def mark_whales_project(event: dict) -> None:
+    """Remember that whales is used in this session's project, so its memory is sent."""
+    project, _ = memory_location(event)
+    if not project:
+        return
+    projects = _read_json(MEMORY_PROJECTS_FILE, [])
+    if project not in projects:
+        _write_json(MEMORY_PROJECTS_FILE, [*projects, project])
+
+
+def _memory_state_path(project: str) -> str:
+    return os.path.join(MEMORY_STATE_DIR, f"{hashlib.sha256(project.encode()).hexdigest()[:24]}.json")
+
+
+def read_memory(memory_dir: str) -> dict:
+    """``name -> (content or None when too large, sha256, mtime)`` of every note in the folder."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(memory_dir, "*.md"))):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        out[os.path.basename(path)] = (text if len(text) <= _MAX_MEMORY_FILE_CHARS else None, digest, mtime)
+    return out
+
+
+def memory_snapshot_bodies(project: str, files: dict, sent: dict, session_key, sent_at: str) -> list:
+    """The uploads that bring whales' copy of the folder up to date: ``[]``
+    when nothing changed since the last accepted snapshot (``sent`` is its
+    manifest). Every upload carries the full manifest; the changed files are
+    split across them."""
+    manifest = {name: digest for name, (_text, digest, _mtime) in files.items()}
+    if manifest == sent:
+        return []
+    changed = [{"name": name, "content": text, "sha256": digest,
+                "mtime": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()}
+               for name, (text, digest, mtime) in files.items()
+               if sent.get(name) != digest and text is not None]
+    too_large = sorted(name for name, (text, _d, _m) in files.items() if text is None)
+    groups, group, size = [], [], 0
+    for item in changed:
+        if group and size + len(item["content"]) > _MAX_MEMORY_BODY_CHARS:
+            groups.append(group)
+            group, size = [], 0
+        group.append(item)
+        size += len(item["content"])
+    groups.append(group)
+    bodies = []
+    for part in groups:
+        raw = {"hook_event_name": "MemorySnapshot", "whales_event": "MemorySnapshot",
+               "client_ts": sent_at, "memory_project": project, "memory_manifest": manifest,
+               "memory_files": part}
+        if too_large:
+            raw["memory_too_large"] = too_large
+        bodies.append(scrub(json.dumps({"source": "claude_code_hook", "session_id": session_key,
+                                        "raw_payload": raw})).encode("utf-8"))
+    return bodies
+
+
+# A gateway that took the snapshot without saying it stored the notes (a
+# backend from before it held them) is asked again after this long, not on
+# every turn.
+_MEMORY_UNCONFIRMED_RETRY_SECONDS = 3600
+
+
+def _send_snapshot(url: str, token: str, body: bytes):
+    """POST one snapshot part. ``(ok, status, reason, stored)``: ``stored`` is
+    whether the answer says whales stored the notes (``memory_notes_stored``).
+    A 2xx alone is not enough: a backend that does not hold notes yet answers
+    200 and keeps nothing, and a snapshot marked sent is never sent again."""
+    request = urllib.request.Request(
+        f"{url}/hooks/ingest", data=body, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            try:
+                answer = json.loads(response.read(65536) or b"{}")
+            except ValueError:
+                answer = {}
+            return True, response.status, "", isinstance(answer, dict) and "memory_notes_stored" in answer
+    except urllib.error.HTTPError as exc:
+        return False, exc.code, str(exc.reason or ""), False
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        return False, None, str(getattr(exc, "reason", "") or exc), False
+
+
+def send_memory_snapshot(event: dict, token: str, session_key, sent_at: str) -> None:
+    """Snapshot the session's project memory when whales is used there and something changed. Detached; the state
+    moves only once every part was stored, so a failure is re-sent at the next event."""
+    project, memory_dir = memory_location(event)
+    if not project or not os.path.isdir(memory_dir) or project not in _read_json(MEMORY_PROJECTS_FILE, []):
+        return
+    state_path = _memory_state_path(project)
+    state = _read_json(state_path, {})
+    if time.time() - float(state.get("unconfirmed_at") or 0) < _MEMORY_UNCONFIRMED_RETRY_SECONDS:
+        return
+    files = read_memory(memory_dir)
+    bodies = memory_snapshot_bodies(project, files, state.get("manifest", {}), session_key, sent_at)
+    if not bodies:
+        return
+    manifest = {name: digest for name, (_text, digest, _mtime) in files.items()}
+
+    def work():
+        url = gateway_url()
+        for body in bodies:
+            ok, status, reason, stored = _send_snapshot(url, token, body)
+            record_send_result(ok, status, reason)
+            if not ok:
+                return
+            if not stored:
+                _write_json(state_path, {**state, "unconfirmed_at": time.time()})
+                return
+        _write_json(state_path, {"project": project, "manifest": manifest})
+
+    run_detached(work)
 
 
 # ---------------------------------------------------------------------------
@@ -1474,6 +1683,9 @@ def main() -> int:
     # ships nothing, so it runs regardless of token or WHALES_CAPTURE — the
     # tool call itself authenticates with the plugin's own credential.
     if args.event == "PreToolUse":
+        if args.source == "claude_code_hook":
+            # Fires only for whales tools (hooks.json's matcher): this project's memory is now sent.
+            mark_whales_project(event)
         out = (session_id_injection(event, prefix) if args.source == "claude_code_hook"
                else cursor_session_id_injection(event, prefix))
         if out:
@@ -1532,6 +1744,13 @@ def main() -> int:
 
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
+
+    if (args.source == "claude_code_hook" and args.event in _MEMORY_EVENTS and memory_on()
+            and state != "rejected"):
+        try:
+            send_memory_snapshot(event, token, f"{prefix}:{session_id}" if session_id else None, sent_at)
+        except Exception:  # noqa: BLE001 — never at the cost of the event's own capture
+            pass
 
     if args.event == "MCPToolResult":
         # Cursor documents both as JSON strings; a structured value would slip
