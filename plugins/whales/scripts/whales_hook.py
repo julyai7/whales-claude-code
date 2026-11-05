@@ -1365,6 +1365,23 @@ def _app_title(folder: str) -> str:
     return ""
 
 
+_README_FILES = ("README.md", "readme.md", "Readme.md", "README.markdown", "README")
+
+
+def _readme_title(folder: str) -> str:
+    """The README's first heading (``# July AI``), which often names the product as people say it. Badges, links and
+    images are taken off; the caller decides whether it says anything (a generic heading, or one that only copies
+    the repo's name, as GitHub's starter README does)."""
+    for rel in _README_FILES:
+        text = _small_file(os.path.join(folder, rel))
+        m = re.search(r"^#\s+(.+?)\s*#*\s*$", text, re.M)
+        if m:
+            title = re.sub(r"!\[[^\]]*\]\([^)]*\)|<[^>]+>", "", m[1])
+            title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title).strip(" *_`")
+            return title[:80]
+    return ""
+
+
 def _package_name(folder: str) -> str:
     """The name in the project's label file, whichever language's it has (package.json, pyproject.toml, Cargo.toml,
     pubspec.yaml, go.mod, a Rails app's module, a Gradle project). A Go module path keeps only its last part."""
@@ -1383,15 +1400,17 @@ def _package_name(folder: str) -> str:
 
 
 def repo_names(root: str) -> dict:
-    """The repo's own names for its product (JUL-1159): the app's title, its package name, and each workspace
-    package's folder, name and title (which may be apps of their own). Only these names leave the
+    """The repo's own names for its product (JUL-1159): the app's title, its package name, its README's heading, and
+    each workspace package's folder, name and title (which may be apps of their own). Only these names leave the
     machine, never file contents. A few small files at known paths, so session start stays fast."""
     names = {}
-    title, package = _app_title(root), _package_name(root)
+    title, package, readme = _app_title(root), _package_name(root), _readme_title(root)
     if title:
         names["title"] = title
     if package:
         names["package"] = package
+    if readme:
+        names["readme"] = readme
     try:
         spec = json.loads(_small_file(os.path.join(root, "package.json")) or "{}").get("workspaces") or []
     except ValueError:
