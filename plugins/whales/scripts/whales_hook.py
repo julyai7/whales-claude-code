@@ -84,7 +84,7 @@ SESSION_ID_TOOLS = frozenset({
     "search_design_history", "submit_design", "record_critique", "record_approval",
     "universal_critique", "list_design_systems", "get_design_system",
     "register_design_system", "generate_design_system", "extract_figma",
-    "product_context", "self_critique",
+    "product_context", "self_critique", "set_session_product",
 })
 
 # A rejected credential, as opposed to a gateway that is down or unreachable.
@@ -1257,6 +1257,249 @@ def _session_start_context(session_id: str, lead: str, prefix: str) -> str:
     )
 
 
+def session_folder(event: dict) -> str:
+    """The folder the session runs in: Claude Code's ``cwd``, Cursor's first workspace root."""
+    roots = event.get("workspace_roots")
+    if event.get("cwd"):
+        return event["cwd"]
+    return roots[0] if isinstance(roots, list) and roots and isinstance(roots[0], str) else ""
+
+
+def git_info(folder: str) -> dict:
+    """The repo the session runs in (JUL-1159): its remote, which names it the same on every machine and in every
+    worktree, and its root, which places the session's folder inside it. Empty outside a repo or without git."""
+    if not folder:
+        return {}
+
+    def git(*args):
+        try:
+            out = subprocess.run(["git", "-C", folder, *args], capture_output=True, text=True, timeout=1.5)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return out.stdout.strip() if out.returncode == 0 else ""
+
+    root = git("rev-parse", "--show-toplevel")
+    if not root:
+        return {}
+    out = {k: v for k, v in {"root": root, "remote": git("remote", "get-url", "origin")}.items() if v}
+    owner_kind = owner_type(out.get("remote", ""))
+    if owner_kind:
+        out["owner_type"] = owner_kind
+    names = repo_names(root)
+    if names:
+        out["names"] = names
+    return out
+
+
+OWNER_TYPES_FILE = os.path.join(CONFIG_DIR, "owner_types.json")
+
+
+def owner_type(remote: str) -> str:
+    """Whether a GitHub remote's owner is an organisation or a person ("Organization" / "User"), from GitHub's public
+    API, once per owner (kept in ~/.whales). Whales offers an organisation's name as a possible product, never a
+    person's own account. Empty when unknown: not GitHub, offline, or rate-limited."""
+    m = re.search(r"github\.com[:/]([\w.-]+)/", remote or "")
+    if not m:
+        return ""
+    owner = m[1].lower()
+    known = _read_json(OWNER_TYPES_FILE, {})
+    if owner in known:
+        return known[owner]
+    try:
+        request = urllib.request.Request(f"https://api.github.com/users/{owner}",
+                                         headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            kind = (json.loads(response.read() or b"{}") or {}).get("type") or ""
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return ""
+    if kind in ("Organization", "User"):
+        _write_json(OWNER_TYPES_FILE, {**known, owner: kind})
+    return kind
+
+
+_TITLE_RE = re.compile(r"<title>\s*([^<{]{2,80}?)\s*</title>|\btitle:\s*[\"']([^\"'\n{]{2,80})[\"']|"
+                       r'"(?:displayName|productName)"\s*:\s*"([^"\n]{2,60})"')
+_TITLE_FILES = ("index.html", "public/index.html", "app/layout.tsx", "app/layout.jsx", "src/app/layout.tsx",
+                "src/app/layout.jsx", "app.json")
+
+
+def _small_file(path: str) -> str:
+    try:
+        if os.path.getsize(path) > 200_000:
+            return ""
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# An app's name as users see it, beyond the web page title: iPhone/Mac (Info.plist) and Android (strings.xml).
+_PLIST_NAME = re.compile(r"<key>CFBundle(?:Display)?Name</key>\s*<string>([^<$]{2,60})</string>")
+_ANDROID_NAME = re.compile(r'<string name="app_name"[^>]*>([^<]{2,60})</string>')
+_NATIVE_TITLE_GLOBS = (("*/Info.plist", _PLIST_NAME), ("ios/*/Info.plist", _PLIST_NAME),
+                       ("app/src/main/res/values/strings.xml", _ANDROID_NAME),
+                       ("android/app/src/main/res/values/strings.xml", _ANDROID_NAME))
+
+# The project's own label file, whatever the language, and where its name sits in it.
+_LABEL_FILES = (
+    ("pyproject.toml", re.compile(r'^\s*name\s*=\s*"([^"]{2,80})"', re.M)),
+    ("Cargo.toml", re.compile(r'^\s*name\s*=\s*"([^"]{2,80})"', re.M)),
+    ("pubspec.yaml", re.compile(r"^name:\s*['\"]?([\w.-]{2,80})", re.M)),
+    ("go.mod", re.compile(r"^module\s+(\S{2,120})", re.M)),
+    ("config/application.rb", re.compile(r"^module\s+(\w{2,80})", re.M)),
+    ("settings.gradle", re.compile(r"rootProject\.name\s*=\s*['\"]([^'\"]{2,80})['\"]")),
+    ("settings.gradle.kts", re.compile(r"rootProject\.name\s*=\s*\"([^\"]{2,80})\"")),
+)
+
+
+def _app_title(folder: str) -> str:
+    for rel in _TITLE_FILES:
+        m = _TITLE_RE.search(_small_file(os.path.join(folder, rel)))
+        if m:
+            return next(g for g in m.groups() if g).strip()
+    for pattern, rx in _NATIVE_TITLE_GLOBS:
+        for path in sorted(glob.glob(os.path.join(folder, pattern)))[:5]:
+            m = rx.search(_small_file(path))
+            if m:
+                return m[1].strip()
+    return ""
+
+
+_README_FILES = ("README.md", "readme.md", "Readme.md", "README.markdown", "README")
+
+
+def _readme_title(folder: str) -> str:
+    """The README's first heading (``# July AI``), which often names the product as people say it. Badges, links and
+    images are taken off; the caller decides whether it says anything (a generic heading, or one that only copies
+    the repo's name, as GitHub's starter README does)."""
+    for rel in _README_FILES:
+        text = _small_file(os.path.join(folder, rel))
+        m = re.search(r"^#\s+(.+?)\s*#*\s*$", text, re.M)
+        if m:
+            title = re.sub(r"!\[[^\]]*\]\([^)]*\)|<[^>]+>", "", m[1])
+            title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title).strip(" *_`")
+            return title[:80]
+    return ""
+
+
+def _package_name(folder: str) -> str:
+    """The name in the project's label file, whichever language's it has (package.json, pyproject.toml, Cargo.toml,
+    pubspec.yaml, go.mod, a Rails app's module, a Gradle project). A Go module path keeps only its last part."""
+    try:
+        name = (json.loads(_small_file(os.path.join(folder, "package.json")) or "{}").get("name") or "").strip()
+    except (ValueError, AttributeError):
+        name = ""
+    if name:
+        return name
+    for rel, rx in _LABEL_FILES:
+        m = rx.search(_small_file(os.path.join(folder, rel)))
+        if m:
+            name = m[1].strip()
+            return name.rstrip("/").rsplit("/", 1)[-1] if rel == "go.mod" else name
+    return ""
+
+
+def repo_names(root: str) -> dict:
+    """The repo's own names for its product (JUL-1159): the app's title, its package name, its README's heading, and
+    each workspace package's folder, name and title (which may be apps of their own). Only these names leave the
+    machine, never file contents. A few small files at known paths, so session start stays fast."""
+    names = {}
+    title, package, readme = _app_title(root), _package_name(root), _readme_title(root)
+    if title:
+        names["title"] = title
+    if package:
+        names["package"] = package
+    if readme:
+        names["readme"] = readme
+    try:
+        spec = json.loads(_small_file(os.path.join(root, "package.json")) or "{}").get("workspaces") or []
+    except ValueError:
+        spec = []
+    globs = spec.get("packages", []) if isinstance(spec, dict) else spec
+    pnpm = _small_file(os.path.join(root, "pnpm-workspace.yaml"))
+    globs = list(globs) + re.findall(r"^\s*-\s*['\"]?([^'\"\n#]+?)['\"]?\s*$", pnpm, re.M)
+    packages = []
+    for pattern in globs[:10]:
+        for folder in sorted(glob.glob(os.path.join(root, pattern.strip().rstrip("/"))))[:30]:
+            name = _package_name(folder)
+            if name:
+                rel = os.path.relpath(folder, root)
+                packages.append({"folder": rel, "name": name, **({"title": t} if (t := _app_title(folder)) else {})})
+    listed = {p["folder"] for p in packages}
+    for folder, kind in app_folders(root).items():
+        if folder in listed:
+            next(p for p in packages if p["folder"] == folder)["kind"] = kind
+        else:
+            entry = {"folder": folder, "kind": kind}
+            name, title = _package_name(os.path.join(root, folder)), _app_title(os.path.join(root, folder))
+            packages.append({**entry, **({"name": name} if name else {}), **({"title": title} if title else {})})
+    if packages:
+        names["packages"] = packages[:40]
+    return names
+
+
+# A file only an app has, and what kind of app it marks: how a repo holding several apps is seen in any language.
+_APP_MARKERS = {"Info.plist": "ios", "AndroidManifest.xml": "android", "index.html": "web", "pubspec.yaml": "flutter",
+                "app.json": "expo"}
+# Folders that are never an app of their own, and folders not worth walking into.
+_NOT_APPS = {"node_modules", "build", "dist", "out", "Pods", "vendor", "DerivedData", "public", "static", "assets",
+             "tmp", "temp", "docs", "doc", "examples", "example", "test", "tests", "fixtures", "e2e", "storybook",
+             "coverage", "scripts", "Tests", "UITests"}
+_APP_PARENTS = ("apps", "sites", "packages", "projects", "clients")
+
+
+def app_folders(root: str, max_depth: int = 5, max_dirs: int = 3000) -> dict:
+    """The repo's app folders, by the files only an app has (``apps/ios`` holds an Info.plist, ``apps/marketing`` an
+    index.html), whatever the language: folder -> kind. An app is named by its top folder (``apps/ios``, or ``ios``
+    at the root); the repo's own root is the project itself, not one of its apps. Bounded, so session start stays
+    fast."""
+    found: dict = {}
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        seen += 1
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        dirnames[:] = [] if depth >= max_depth or seen > max_dirs else sorted(
+            d for d in dirnames if not d.startswith(".") and d not in _NOT_APPS)
+        if rel == ".":
+            continue
+        parts = rel.split(os.sep)
+        top = os.sep.join(parts[:2]) if parts[0] in _APP_PARENTS and len(parts) > 1 else parts[0]
+        if top in _APP_PARENTS:
+            continue
+        for marker, kind in _APP_MARKERS.items():
+            if marker in filenames:
+                found.setdefault(top.replace(os.sep, "/"), kind)
+    return found
+
+
+def product_context(url: str, token: str, session_key: str, folder: str, git: dict) -> str:
+    """What whales tells the agent about the product this session is for (JUL-1159): the product, the products this
+    repo holds and their folders, or the one question to ask. Empty on any failure: the session must start anyway."""
+    body = json.dumps({"client_session_id": session_key, "folder": folder or None, "git": git or None}).encode()
+    request = urllib.request.Request(f"{url}/hooks/session-start", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            return (json.loads(response.read() or b"{}") or {}).get("context") or ""
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return ""
+
+
+def pending_question(url: str, token: str, session_key: str, prompt: str) -> str:
+    """The product question whales wants asked on this prompt (JUL-1159): its first ask, a reminder, or "Are you now
+    working on X?" when this prompt names another of the designer's products. Empty on any failure or nothing to ask:
+    the prompt must go through anyway, so the wait is short."""
+    body = json.dumps({"client_session_id": session_key, "prompt": prompt or None}).encode()
+    request = urllib.request.Request(f"{url}/hooks/pending-question", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return (json.loads(response.read() or b"{}") or {}).get("question") or ""
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return ""
+
+
 def session_id_injection(event: dict, prefix: str):
     """The PreToolUse output that adds ``client_session_id`` to a whales call,
     or ``None`` when there is nothing to do.
@@ -1305,7 +1548,7 @@ def _cursor_tool_input(event: dict):
     return tool_input if isinstance(tool_input, dict) else None
 
 
-def cursor_session_start_output(session_id: str, lead: str, prefix: str) -> dict:
+def cursor_session_start_output(session_id: str, lead: str, prefix: str, extra: str = "") -> dict:
     """Cursor's sessionStart answer (https://cursor.com/docs/hooks).
 
     ``additional_context`` reaches the model; ``env`` is passed to every later
@@ -1315,7 +1558,7 @@ def cursor_session_start_output(session_id: str, lead: str, prefix: str) -> dict
     no id at all.
     """
     return {
-        "additional_context": _session_start_context(session_id, lead, prefix),
+        "additional_context": "\n\n".join(t for t in (_session_start_context(session_id, lead, prefix), extra) if t),
         "env": {"WHALES_CLIENT_SESSION_ID": f"{prefix}:{session_id}"},
     }
 
@@ -1713,16 +1956,19 @@ def main() -> int:
     # Each host has its own answer shape. Claude Code reads
     # hookSpecificOutput.additionalContext; Cursor reads additional_context
     # and env (see cursor_session_start_output). The wrong shape is ignored.
+    git = git_info(session_folder(event)) if args.event == "SessionStart" else {}
+    product = (product_context(gateway_url(), token, f"{prefix}:{session_id}", session_folder(event), git)
+               if args.event == "SessionStart" and session_id and token and state != "rejected" else "")
     if args.event == "SessionStart" and session_id and args.source == "cursor_hook":
         print(json.dumps(cursor_session_start_output(
-            session_id, _capture_lead(state, status), prefix)))
+            session_id, _capture_lead(state, status), prefix, product)))
     if args.event == "SessionStart" and session_id and args.source == "claude_code_hook":
         out = {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": _session_start_context(
+                "additionalContext": "\n\n".join(t for t in (_session_start_context(
                     session_id, _capture_lead(state, status), prefix
-                ),
+                ), product) if t),
             }
         }
         if state == "rejected":
@@ -1738,7 +1984,12 @@ def main() -> int:
         # At both ends of a turn: an update started by this prompt usually
         # lands while the agent works, and Stop tells the designer then.
         check_for_update()
-        notice = restart_notice(session_id)
+        notice = restart_notice(session_id) or {}
+        question = (pending_question(gateway_url(), token, f"{prefix}:{session_id}",
+                                     prompt_user_text(event.get("prompt")) or str(event.get("prompt") or ""))
+                    if args.event == "UserPromptSubmit" and session_id and token and state != "rejected" else "")
+        if question:
+            notice["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": question}
         if notice:
             print(json.dumps(notice))
 
@@ -1776,6 +2027,8 @@ def main() -> int:
     # read this to treat both hosts alike.
     payload["raw_payload"]["whales_event"] = args.event
     payload["raw_payload"]["client_ts"] = sent_at
+    if git:
+        payload["raw_payload"]["whales_git"] = git
     # Both read the event before truncate() capped it: a long host preamble
     # can push the designer's own words past the cap.
     user_text = prompt_user_text(event.get("prompt"))
