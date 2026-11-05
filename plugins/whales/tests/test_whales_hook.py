@@ -577,8 +577,8 @@ def test_a_rejected_token_sends_events_without_re_sending_the_transcript(tmp_pat
 
 
 def _serve(status):
-    """A one-request local gateway that answers with ``status`` and keeps the
-    body it received."""
+    """A local gateway that answers the event upload with ``status`` and keeps
+    the body it received. The prompt's product question gets an empty answer."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -587,7 +587,13 @@ def _serve(status):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
-            received["body"] = json.loads(self.rfile.read(length))
+            body = json.loads(self.rfile.read(length))
+            if self.path.endswith("/hooks/pending-question"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+                return
+            received.setdefault("body", body)
             self.send_response(status)
             self.end_headers()
 
@@ -595,7 +601,7 @@ def _serve(status):
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.handle_request, daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, received
 
 
@@ -1470,3 +1476,37 @@ def _sha256(path) -> str:
     import hashlib
 
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_a_product_question_whales_has_reaches_the_agent_on_the_next_prompt(tmp_path, monkeypatch, capsys):
+    # JUL-1159: whales asks on the designer's next message, and hears what they
+    # typed so it can notice a switch to another of their products.
+    import io
+
+    monkeypatch.setattr(wh, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(wh, "TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setattr(wh, "GATEWAY_FILE", str(tmp_path / "gateway"))
+    monkeypatch.setattr(wh, "STATUS_FILE", str(tmp_path / "capture_status.json"))
+    monkeypatch.setattr(wh, "OFFSET_DIR", str(tmp_path / "offsets"))
+    monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(tmp_path / "synthetic"))
+    (tmp_path / "token").write_text("tok")
+    asked = []
+    monkeypatch.setattr(wh, "check_for_update", lambda: None)
+    monkeypatch.setattr(wh, "restart_notice", lambda sid: None)
+    monkeypatch.setattr(wh, "post_detached", lambda *a, **k: None)
+    monkeypatch.setattr(wh, "pending_question", lambda url, token, key, prompt: asked.append((key, prompt))
+                        or "Are you now working on Stuut, or still on Matterhaul?")
+    monkeypatch.setattr(sys, "argv", ["whales_hook.py", "--event", "UserPromptSubmit"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "s1", "prompt": "now the Stuut invoices page"})))
+    assert wh.main() == 0
+    assert asked == [("cc:s1", "now the Stuut invoices page")]
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["hookSpecificOutput"] == {"hookEventName": "UserPromptSubmit",
+                                         "additionalContext": "Are you now working on Stuut, or still on Matterhaul?"}
+
+
+def test_a_gateway_that_does_not_answer_never_holds_up_the_prompt(monkeypatch):
+    def down(*a, **k):
+        raise wh.urllib.error.URLError("down")
+    monkeypatch.setattr(wh.urllib.request, "urlopen", down)
+    assert wh.pending_question("https://gw", "tok", "cc:s1", "hi") == ""

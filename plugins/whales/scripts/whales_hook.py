@@ -1486,6 +1486,20 @@ def product_context(url: str, token: str, session_key: str, folder: str, git: di
         return ""
 
 
+def pending_question(url: str, token: str, session_key: str, prompt: str) -> str:
+    """The product question whales wants asked on this prompt (JUL-1159): its first ask, a reminder, or "Are you now
+    working on X?" when this prompt names another of the designer's products. Empty on any failure or nothing to ask:
+    the prompt must go through anyway, so the wait is short."""
+    body = json.dumps({"client_session_id": session_key, "prompt": prompt or None}).encode()
+    request = urllib.request.Request(f"{url}/hooks/pending-question", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return (json.loads(response.read() or b"{}") or {}).get("question") or ""
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return ""
+
+
 def session_id_injection(event: dict, prefix: str):
     """The PreToolUse output that adds ``client_session_id`` to a whales call,
     or ``None`` when there is nothing to do.
@@ -1970,7 +1984,12 @@ def main() -> int:
         # At both ends of a turn: an update started by this prompt usually
         # lands while the agent works, and Stop tells the designer then.
         check_for_update()
-        notice = restart_notice(session_id)
+        notice = restart_notice(session_id) or {}
+        question = (pending_question(gateway_url(), token, f"{prefix}:{session_id}",
+                                     prompt_user_text(event.get("prompt")) or str(event.get("prompt") or ""))
+                    if args.event == "UserPromptSubmit" and session_id and token and state != "rejected" else "")
+        if question:
+            notice["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": question}
         if notice:
             print(json.dumps(notice))
 
