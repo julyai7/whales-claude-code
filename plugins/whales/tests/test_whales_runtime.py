@@ -102,6 +102,12 @@ class TestRecipes:
         recipes = rt.load_recipes(str(tmp_path))
         assert [r["name"] for r in recipes] == ["checkout"]
 
+    def test_recipes_on_this_turns_routes_run_first(self, tmp_path):
+        for name, route in (("a-home", "/"), ("b-book", "/book?fail=1"), ("c-settings", "/settings")):
+            write(tmp_path / ".whales" / "recipes" / f"{name}.json", json.dumps({"route": route, "steps": [{"do": "wait"}]}))
+        assert [r["name"] for r in rt.load_recipes(str(tmp_path), ["/settings", "/book"])] == ["b-book", "c-settings", "a-home"]
+        assert [r["name"] for r in rt.load_recipes(str(tmp_path))] == ["a-home", "b-book", "c-settings"]
+
 
 class TestRunCapture:
     def test_no_dev_server_is_a_status_not_an_error(self, tmp_path, monkeypatch):

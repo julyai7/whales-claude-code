@@ -76,7 +76,15 @@
       }
     }, true)
   }
-  W.begin = (hold = false) => { W.t0 = performance.now(); W.rows = []; W.seen = new WeakSet(); W.hold = hold; W.held = [] }
+  // Web Animations fire no event, and a short one is over before the next sweep:
+  // record each one as it is made.
+  const animate = Element.prototype.animate
+  Element.prototype.animate = function (...args) {
+    const anim = animate.apply(this, args)
+    try { record(anim, 'animate') } catch {}
+    return anim
+  }
+  W.begin =(hold = false) => { W.t0 = performance.now(); W.rows = []; W.seen = new WeakSet(); W.hold = hold; W.held = [] }
   W.take = () => { W.sweep(); return W.rows }
   // Seek every held animation to the same fraction of its own active time.
   W.seek = (f) => W.held.forEach((a) => {

@@ -357,7 +357,9 @@ def added_classes(patch: str, limit: int = 60) -> list:
     return seen[:limit]
 
 
-def load_recipes(top: str) -> list:
+def load_recipes(top: str, routes: list | None = None) -> list:
+    """The repo's recipes, those on this turn's routes first: the time budget
+    runs out on the last ones, and those are the ones the turn didn't touch."""
     out = []
     folder = os.path.join(top, ".whales", "recipes")
     try:
@@ -373,6 +375,8 @@ def load_recipes(top: str) -> list:
         if isinstance(recipe, dict) and isinstance(recipe.get("steps"), list):
             recipe.setdefault("name", os.path.splitext(name)[0])
             out.append(recipe)
+    on_route = set(routes or [])
+    out.sort(key=lambda r: str(r.get("route", "/")).split("?")[0] not in on_route)
     return out
 
 
@@ -415,10 +419,10 @@ def run_capture(job: dict) -> dict:
     if not node:
         return {"status": "no_browser", "detail": why}
     _, tree_before = hook.snapshot_tree(top)
+    routes = job.get("routes") or routes_for(top, job.get("files", []))
     spec = {
-        "base_url": url, "out_dir": out_dir, "budget_ms": BUDGET_MS,
-        "routes": job.get("routes") or routes_for(top, job.get("files", [])),
-        "focus_classes": job.get("focus_classes", []), "recipes": load_recipes(top),
+        "base_url": url, "out_dir": out_dir, "budget_ms": BUDGET_MS, "routes": routes,
+        "focus_classes": job.get("focus_classes", []), "recipes": load_recipes(top, routes),
     }
     job_file = os.path.join(out_dir, "job.json")
     with open(job_file, "w") as fh:
