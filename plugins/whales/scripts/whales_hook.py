@@ -1173,6 +1173,163 @@ def with_screen(body: bytes, job: dict) -> bytes:
         return body
 
 
+# ---------------------------------------------------------------------------
+# Turn diff: every UI file the turn changed, however it changed it
+#
+# Edit capture sees only the Write/Edit tools. A host that edits with a Bash
+# heredoc, sed or a script is invisible to it: in Ruolan's Oct 28 session 52
+# of 74 UI edits went through Bash. So the working tree itself is compared:
+# a snapshot when the prompt is submitted, another at Stop, and the diff of
+# the two rides on the Stop event. The prompt's own event carries what changed
+# since the previous Stop: edits the designer made by hand between turns.
+#
+# Never written into the designer's repo. The snapshot is a git tree built
+# with a private index and object store under ~/.whales/turns, with the
+# repo's own objects as an alternate, so unchanged files cost nothing. Only UI
+# paths are added: no .env, no lockfiles, no large binaries.
+# WHALES_TURN_DIFF=off turns it off; WHALES_CAPTURE=off already does.
+# ---------------------------------------------------------------------------
+
+TURNS_DIR = os.path.join(CONFIG_DIR, "turns")
+UI_PATHSPECS = tuple(f":(glob)**/*.{ext}" for ext in (
+    "tsx", "jsx", "ts", "js", "mjs", "cjs", "css", "scss", "sass", "less", "html", "vue",
+    "svelte", "astro", "mdx")) + (":(glob)**/tailwind.config.*", ":(glob)**/package.json")
+# Each git call; the whole snapshot runs inside the hook's own timeout.
+_GIT_SECONDS = 3
+_MAX_PATCH_CHARS = 120_000
+_MAX_DIFF_FILES = 200
+
+
+def turn_diff_on() -> bool:
+    return os.environ.get("WHALES_TURN_DIFF", "").lower() not in ("0", "off", "false", "no")
+
+
+def _git(args: list, cwd: str, env: dict | None = None, stdin: str | None = None):
+    """``(ok, stdout)`` of one git call. Never raises."""
+    try:
+        done = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True,
+                              text=True, timeout=_GIT_SECONDS, input=stdin)
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    return done.returncode == 0, done.stdout
+
+
+def _repo(cwd: str) -> dict:
+    """The repo ``cwd`` is in: its top level, index and object store. ``{}``
+    outside a repo. Asked of git, not assumed: a worktree's ``.git`` is a file."""
+    if not cwd or not os.path.isdir(cwd):
+        return {}
+    ok, out = _git(["rev-parse", "--show-toplevel", "--git-path", "index", "--git-path", "objects"], cwd)
+    lines = out.strip().splitlines()
+    if not ok or len(lines) != 3:
+        return {}
+    top, index, objects = lines
+    index = index if os.path.isabs(index) else os.path.join(cwd, index)
+    objects = objects if os.path.isabs(objects) else os.path.join(cwd, objects)
+    key = hashlib.sha256(os.path.realpath(top).encode()).hexdigest()[:16]
+    return {"top": top, "index": index, "objects": objects, "key": key}
+
+
+def _snapshot_env(repo: dict, index_file: str) -> dict:
+    store = os.path.join(TURNS_DIR, "objects", repo["key"])
+    os.makedirs(store, exist_ok=True)
+    env = dict(os.environ)
+    env.update({"GIT_INDEX_FILE": index_file, "GIT_OBJECT_DIRECTORY": store,
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": repo["objects"]})
+    return env
+
+
+def snapshot_tree(cwd: str):
+    """``(repo, tree_sha)`` of the UI files as they are now, or ``(repo, None)``."""
+    repo = _repo(cwd)
+    if not repo:
+        return {}, None
+    index_file = os.path.join(TURNS_DIR, f"index-{repo['key']}-{os.getpid()}")
+    try:
+        os.makedirs(TURNS_DIR, exist_ok=True)
+        try:
+            # Start from the repo's own index, so only files that changed are hashed.
+            with open(repo["index"], "rb") as src, open(index_file, "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+        env = _snapshot_env(repo, index_file)
+        # Listed first, then added by name: `git add` refuses a pathspec that
+        # matches nothing (a repo without a tailwind config), `ls-files` does not.
+        ok, changed = _git(["ls-files", "-z", "--modified", "--others", "--deleted",
+                            "--exclude-standard", "--", *UI_PATHSPECS], repo["top"], env)
+        if not ok:
+            return repo, None
+        if changed.strip("\0"):
+            ok, _ = _git(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                         repo["top"], env, stdin=changed)
+            if not ok:
+                return repo, None
+        ok, tree = _git(["write-tree"], repo["top"], env)
+        return repo, (tree.strip() or None) if ok else None
+    except OSError:
+        return repo, None
+    finally:
+        try:
+            os.unlink(index_file)
+        except OSError:
+            pass
+
+
+def tree_diff(repo: dict, base: str, head: str) -> dict:
+    """What changed in UI files from ``base`` to ``head``; ``{}`` when nothing did."""
+    if not base or not head or base == head:
+        return {}
+    env = _snapshot_env(repo, os.path.join(TURNS_DIR, "unused-index"))
+    ok, numstat = _git(["diff", "--numstat", "--no-renames", base, head, "--", *UI_PATHSPECS], repo["top"], env)
+    if not ok or not numstat.strip():
+        return {}
+    files = []
+    for line in numstat.strip().splitlines()[:_MAX_DIFF_FILES]:
+        added, removed, path = (line.split("\t", 2) + ["", "", ""])[:3]
+        files.append({"path": path, "added": int(added) if added.isdigit() else None,
+                      "removed": int(removed) if removed.isdigit() else None})
+    _, patch = _git(["diff", "--no-renames", "-U3", base, head, "--", *UI_PATHSPECS], repo["top"], env)
+    out = {"base": base, "head": head, "files": files, "patch": patch[:_MAX_PATCH_CHARS]}
+    if len(patch) > _MAX_PATCH_CHARS:
+        out["patch_truncated"] = len(patch)
+    return out
+
+
+def _turn_state_path(session_id: str) -> str:
+    return os.path.join(TURNS_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
+
+
+def turn_diff(event: dict, event_name: str, session_id: str):
+    """``(key, value)`` to stamp on the event, or ``None``.
+
+    UserPromptSubmit: snapshot the turn's start; report what changed since the
+    previous Stop (the designer's own edits). Stop: report what the turn
+    changed, and keep its end as the fallback start of the next turn.
+    """
+    if event_name not in ("UserPromptSubmit", "Stop") or not session_id or not turn_diff_on():
+        return None
+    repo, tree = snapshot_tree(event.get("cwd") or "")
+    if not repo:
+        return None
+    state_path = _turn_state_path(session_id)
+    state = _read_json(state_path, {})
+    if state.get("repo") != repo["top"]:
+        state = {}
+    if not tree:
+        return "whales_turn_diff", {"error": "snapshot failed", "repo": repo["top"]}
+    if event_name == "UserPromptSubmit":
+        between = tree_diff(repo, state.get("end", ""), tree)
+        _write_json(state_path, {"repo": repo["top"], "start": tree, "end": state.get("end", ""), "at": _now()})
+        return ("whales_between_turns_diff", {"repo": repo["top"], **between}) if between else None
+    base = state.get("start") or state.get("end") or ""
+    _write_json(state_path, {"repo": repo["top"], "start": "", "end": tree, "at": _now()})
+    if not base:
+        return "whales_turn_diff", {"repo": repo["top"], "head": tree, "error": "no start snapshot"}
+    diff = tree_diff(repo, base, tree)
+    return "whales_turn_diff", {"repo": repo["top"], **(diff or {"base": base, "head": tree, "files": []})}
+
+
 def _send(url: str, token: str, body: bytes):
     """POST one event. Returns ``(ok, http_status_or_None, reason)``.
 
@@ -1784,6 +1941,13 @@ def main() -> int:
     kind = synthetic_kind(event, session_id, args.event)
     if kind:
         payload["raw_payload"]["synthetic"] = kind
+    if args.source == "claude_code_hook":
+        try:
+            stamped = turn_diff(event, args.event, session_id)
+        except Exception:  # noqa: BLE001 — a diff must never cost the event itself
+            stamped = None
+        if stamped:
+            payload["raw_payload"][stamped[0]] = stamped[1]
 
     # While the token is known to be rejected, send the event without the
     # transcript. Retrying is what keeps transcript from being lost, but
