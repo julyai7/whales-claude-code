@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -1330,6 +1331,27 @@ def turn_diff(event: dict, event_name: str, session_id: str):
     return "whales_turn_diff", {"repo": repo["top"], **(diff or {"base": base, "head": tree, "files": []})}
 
 
+def start_runtime_capture(session_key, diff: dict):
+    """Start a runtime capture of the turn's UI change (detached); what to
+    stamp on the Stop event, or ``None``. The capture sends its own
+    ``RuntimeCapture`` event under the same id when it is done. Only beside
+    the plugin's whales_runtime.py: Cursor's copy of this script has none."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whales_runtime.py")
+    if not os.path.isfile(path) or not diff.get("repo"):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("whales_runtime", path)
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        if not runtime.runtime_on():
+            return None
+        job = runtime.new_job(session_key, diff["repo"], diff)
+        runtime.start_detached(job)
+    except Exception:  # noqa: BLE001 — a capture must never cost the event itself
+        return None
+    return {"capture_id": job["capture_id"], "status": "started"}
+
+
 def _send(url: str, token: str, body: bytes):
     """POST one event. Returns ``(ok, http_status_or_None, reason)``.
 
@@ -1948,6 +1970,10 @@ def main() -> int:
             stamped = None
         if stamped:
             payload["raw_payload"][stamped[0]] = stamped[1]
+        if stamped and args.event == "Stop" and stamped[1].get("files"):
+            started = start_runtime_capture(session_key, stamped[1])
+            if started:
+                payload["raw_payload"]["whales_runtime_capture"] = started
 
     # While the token is known to be rejected, send the event without the
     # transcript. Retrying is what keeps transcript from being lost, but
