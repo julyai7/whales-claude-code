@@ -28,7 +28,7 @@ const timeLeft = () => deadline - Date.now()
 const DESKTOP = { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 }
 const PHONE = 'iPhone 15 Pro'
 const LIMIT = { hover: 30, focus: 20, scroll: 120 }
-const STYLE_PROPS = ['color', 'backgroundColor', 'borderColor', 'boxShadow', 'outlineStyle', 'outlineColor', 'outlineWidth', 'opacity', 'transform', 'textDecorationLine']
+const STYLE_PROPS = ['color', 'backgroundColor', 'borderColor', 'boxShadow', 'outlineStyle', 'outlineColor', 'outlineWidth', 'opacity', 'transform', 'translate', 'scale', 'rotate', 'filter', 'textDecorationLine']
 
 const result = {
   version: 1, base_url: job.base_url, started_at: new Date().toISOString(), tool: 'playwright chromium headless-shell',
