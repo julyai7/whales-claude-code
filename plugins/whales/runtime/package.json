@@ -1,0 +1,9 @@
+{
+  "name": "whales-runtime-capture",
+  "private": true,
+  "description": "Headless browser for whales runtime capture. Installed into ~/.whales/runtime by the plugin; never into the designer's project.",
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.56.1"
+  }
+}
