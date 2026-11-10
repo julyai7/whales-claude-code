@@ -447,7 +447,7 @@ def run_capture(job: dict) -> dict:
     capture["routes_requested"] = spec["routes"]
     with open(os.path.join(out_dir, "capture.json"), "w") as fh:
         json.dump(capture, fh, indent=1)
-    return {"status": capture.get("status", "ok"), "capture": capture, "base_url": url,
+    return {"status": capture.get("status", "ok"), "capture": capture, "base_url": url, "out_dir": out_dir,
             "report": os.path.join(out_dir, "report.html")}
 
 
@@ -462,12 +462,69 @@ def send_capture(job: dict, outcome: dict) -> None:
         "capture_id": job["capture_id"], "turn_head": job.get("turn_head"), "cwd": job["repo"],
         "status": outcome["status"], "detail": outcome.get("detail"), "base_url": outcome.get("base_url"),
     }
+    files = capture_files(outcome.get("out_dir", "")) if outcome.get("capture") else []
     if outcome.get("capture"):
         raw["capture"] = slim_for_event(outcome["capture"])
+        raw["files"] = [name for name, _ in files]
     body = hook.scrub(json.dumps({"source": "claude_code_hook", "session_id": job.get("session_key"),
                                   "raw_payload": raw})).encode("utf-8")
     ok, status, reason = hook._send(hook.gateway_url(), token, body)
     hook.record_send_result(ok, status, reason)
+    if ok and files:
+        outcome["files_stored"] = upload_files(hook.gateway_url(), token, job["capture_id"], files)
+
+
+# Most files and bytes one capture uploads: a capture is a few dozen crops and frames.
+MAX_UPLOAD_FILES = 120
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024
+_UPLOAD_TYPES = {".png": "image/png", ".json": "application/json", ".html": "text/html"}
+
+
+def capture_files(out_dir: str) -> list:
+    """``[(name, path)]`` to upload: capture.json, the report, then the media.
+
+    Stored flat under the capture's id, so the report's ``media/`` links are
+    rewritten as it is sent (see ``upload_files``)."""
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+    files = [(n, os.path.join(out_dir, n)) for n in ("capture.json", "report.html")
+             if os.path.isfile(os.path.join(out_dir, n))]
+    media = os.path.join(out_dir, "media")
+    if os.path.isdir(media):
+        files += [(n, os.path.join(media, n)) for n in sorted(os.listdir(media))
+                  if os.path.splitext(n)[1].lower() in _UPLOAD_TYPES]
+    out, total = [], 0
+    for name, path in files[:MAX_UPLOAD_FILES]:
+        total += os.path.getsize(path)
+        if total > MAX_UPLOAD_BYTES:
+            break
+        out.append((name, path))
+    return out
+
+
+def upload_files(gateway: str, token: str, capture_id: str, files: list) -> int:
+    """PUT each file to whales (S3 behind it). Returns how many were stored."""
+    stored = 0
+    for name, path in files:
+        try:
+            with open(path, "rb") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        if name == "report.html":
+            content = content.replace(b'src="media/', b'src="')
+        elif name == "capture.json":
+            content = _hook().scrub(content.decode("utf-8", "replace")).encode("utf-8")
+        req = urllib.request.Request(
+            f"{gateway}/runtime-captures/{capture_id}/files/{name}", data=content, method="PUT",
+            headers={"Content-Type": _UPLOAD_TYPES[os.path.splitext(name)[1].lower()],
+                     "Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                stored += resp.status < 300
+        except Exception:  # noqa: BLE001 — a file that did not go is counted, never raised
+            continue
+    return stored
 
 
 def capture_job(job_path: str) -> int:
@@ -487,9 +544,10 @@ def capture_job(job_path: str) -> int:
         while True:
             job.setdefault("out_dir", os.path.join(CAPTURES_DIR, key, job["capture_id"]))
             outcome = run_capture(job)
-            write_status(capture_id=job["capture_id"], repo=top, status=outcome["status"],
-                         detail=outcome.get("detail"), report=outcome.get("report"))
             send_capture(job, outcome)
+            write_status(capture_id=job["capture_id"], repo=top, status=outcome["status"],
+                         detail=outcome.get("detail"), report=outcome.get("report"),
+                         files_stored=outcome.get("files_stored"))
             try:
                 with open(again) as fh:
                     job = json.load(fh)

@@ -179,3 +179,42 @@ class TestHookStartsIt:
         out = wh.start_runtime_capture("cc:s1", {"repo": str(tmp_path), "head": "h", "files": [{"path": "a.tsx"}], "patch": ""})
         assert out["status"] == "started" and out["capture_id"] == started[0]["capture_id"]
         assert started[0]["session_key"] == "cc:s1"
+
+
+class TestFiles:
+    def test_capture_json_report_then_media_flat(self, tmp_path):
+        (tmp_path / "media").mkdir()
+        for n in ("002_b.png", "001_a.png", "notes.txt"):
+            (tmp_path / "media" / n).write_bytes(b"x")
+        (tmp_path / "capture.json").write_text("{}")
+        (tmp_path / "report.html").write_text('<img src="media/001_a.png">')
+        (tmp_path / "job.json").write_text("{}")
+        names = [n for n, _ in rt.capture_files(str(tmp_path))]
+        assert names == ["capture.json", "report.html", "001_a.png", "002_b.png"]
+
+    def test_stops_at_the_byte_ceiling(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rt, "MAX_UPLOAD_BYTES", 5)
+        (tmp_path / "capture.json").write_text("{}")
+        (tmp_path / "report.html").write_text("123456")
+        assert [n for n, _ in rt.capture_files(str(tmp_path))] == ["capture.json"]
+
+    def test_upload_rewrites_the_reports_links_and_counts_what_was_stored(self, tmp_path, monkeypatch):
+        (tmp_path / "report.html").write_bytes(b'<img src="media/001_a.png">')
+        (tmp_path / "a.png").write_bytes(b"PNG")
+        sent = []
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout):
+            sent.append((req.full_url, req.get_method(), req.data, req.headers["Content-type"]))
+            if req.full_url.endswith("a.png"):
+                raise rt.urllib.error.HTTPError(req.full_url, 500, "x", {}, None)
+            return Resp()
+        monkeypatch.setattr(rt.urllib.request, "urlopen", fake_urlopen)
+        n = rt.upload_files("https://gw", "tok", "rc_1", [("report.html", str(tmp_path / "report.html")),
+                                                          ("a.png", str(tmp_path / "a.png"))])
+        assert n == 1
+        assert sent[0] == ("https://gw/runtime-captures/rc_1/files/report.html", "PUT", b'<img src="001_a.png">', "text/html")
