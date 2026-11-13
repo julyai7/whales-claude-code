@@ -67,6 +67,13 @@ const cap = (page, fn, arg) => page.evaluate(([fn, arg]) => window.__whalesCap[f
 const styleOf = (handle) => handle.evaluate((el, props) => { const cs = getComputedStyle(el), o = {}; for (const p of props) o[p] = cs[p]; return o }, STYLE_PROPS)
 const diffStyles = (a, b) => Object.fromEntries(Object.keys(a).filter((k) => a[k] !== b[k]).map((k) => [k, [a[k], b[k]]]))
 const pad = (box, n = 6) => box && { x: Math.max(0, box.x - n), y: Math.max(0, box.y - n), width: box.width + 2 * n, height: box.height + 2 * n }
+// Whether an animation still takes time (reduced motion often shortens it to ~0).
+const runs = (r) => typeof r.duration_ms === 'number' ? r.duration_ms > 1 : !/^0(\.0+)?(e-?\d+)?s|^1e-0\d+s|^0\.00\d*s/.test(String(r.duration_ms))
+// Whether it moves something: position, size, transform. A fade or a colour change is what reduced motion keeps, so
+// it isn't counted. With no keyframes to read (an animation over before it was seen), assume it does.
+const TRAVEL = /^(transform|translate|scale|rotate|offset|top|left|right|bottom|inset|width|height|margin|padding)/i
+const travels = (r) => !Array.isArray(r.keyframes) || !r.keyframes.length ||
+  r.keyframes.some((k) => Object.keys(k).some((p) => TRAVEL.test(p) && k[p] !== 'none' && k[p] !== ''))
 const slim = (rows) => rows.map(({ target, keyframes, ...r }) => ({
   ...r, on: target && { tag: target.tag, label: target.label, text: target.text, classes: target.classes, box: target.box },
   keyframes: keyframes && keyframes.length <= 6 ? keyframes : undefined,
@@ -261,8 +268,9 @@ async function captureRoute(route) {
       const { page } = await open(rm, route)
       await page.waitForTimeout(2500)
       const rows = await cap(page, 'take')
-      const moving = (r) => typeof r.duration_ms === 'number' ? r.duration_ms > 1 : !/^0(\.0+)?(e-?\d+)?s|^1e-0\d+s|^0\.00\d*s/.test(String(r.duration_ms))
-      out.reduced_motion = { animations_on_load: rows.length, still_moving: rows.filter(moving).length, examples: slim(rows.filter(moving).slice(0, 8)) }
+      const moving = (r) => runs(r) && travels(r)
+      out.reduced_motion = { animations_on_load: rows.length, still_moving: rows.filter(moving).length,
+                             still_fading: rows.filter((r) => runs(r) && !travels(r)).length, examples: slim(rows.filter(moving).slice(0, 8)) }
     } catch (e) { out.reduced_motion = { error: String(e).slice(0, 200) } } finally { await rm.close() }
   }
   if (timeLeft() > 8000) {
@@ -327,15 +335,26 @@ async function runRecipe(recipe) {
   return out
 }
 
+// A recipe belongs to the page its route opens, query aside: '/?empty=1' is a state of '/'.
+const pathOf = (route) => String(route || '/').split('?')[0].split('#')[0] || '/'
+
 try {
+  // Each page, then straight away the recipes on it: the time budget runs out on what comes last, and the pages the
+  // turn touched come first (job.routes), so their flows are never starved by a full sweep of another page.
+  const pending = [...(job.recipes || [])]
+  const runRecipes = async (which) => {
+    for (const recipe of which) {
+      pending.splice(pending.indexOf(recipe), 1)
+      if (timeLeft() < 10000) { result.notes.push(`recipe ${recipe.name} skipped: time budget`); continue }
+      result.recipes.push(await runRecipe(recipe))
+    }
+  }
   for (const route of job.routes || ['/']) {
-    if (timeLeft() < 15000) { result.notes.push(`route ${route} skipped: time budget`); continue }
-    result.routes.push(await captureRoute(route))
+    if (timeLeft() < 15000) { result.notes.push(`route ${route} skipped: time budget`) }
+    else result.routes.push(await captureRoute(route))
+    await runRecipes(pending.filter((r) => pathOf(r.route) === pathOf(route)))
   }
-  for (const recipe of job.recipes || []) {
-    if (timeLeft() < 10000) { result.notes.push(`recipe ${recipe.name} skipped: time budget`); continue }
-    result.recipes.push(await runRecipe(recipe))
-  }
+  await runRecipes([...pending])
 } catch (e) {
   result.status = 'error'
   result.error = String(e).slice(0, 400)
@@ -351,7 +370,7 @@ console.log(JSON.stringify({ status: result.status, routes: result.routes.length
 function report(r) {
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
   const name = (t) => esc(t?.label || t?.text || t?.tag || '')
-  const motionRows = (rows) => (rows || []).filter((m) => m.name).map((m) => `<tr><td>${esc(m.kind)}</td><td>${esc(m.name)}</td><td>${name(m.on)}</td><td>${esc(m.start_ms)}</td><td>${esc(m.duration_ms)}</td><td>${esc(m.delay_ms)}</td><td><code>${esc(m.curve)}</code></td></tr>`).join('')
+  const motionRows = (rows) => (rows || []).filter((m) => m.name).map((m) => `<tr><td>${esc(m.kind)}</td><td>${esc(m.name)}</td><td>${name(m.on)}${m.pseudo ? ` <code>${esc(m.pseudo)}</code>` : ''}</td><td>${esc(m.start_ms)}</td><td>${esc(m.duration_ms)}</td><td>${esc(m.delay_ms)}</td><td><code>${esc(m.curve)}</code></td></tr>`).join('')
   const motionTable = (rows) => rows?.length ? `<table><tr><th>kind</th><th>what</th><th>on</th><th>starts ms</th><th>duration ms</th><th>delay ms</th><th>curve</th></tr>${motionRows(rows)}</table>` : '<p class="dim">none</p>'
   const img = (src) => src ? `<img src="${esc(src)}" loading="lazy">` : ''
   const route = (x) => `
@@ -367,7 +386,7 @@ function report(r) {
   ${(x.hover?.results || []).map((h) => `<div class="card"><b>${name(h.target)}</b> ${h.visible ? '' : '<span class="bad">no visible change</span>'}<div>${h.media.map(img).join('')}</div>${h.style_changes.map((c) => `<div class="dim">${esc(c.part)}: ${Object.entries(c.diff).map(([k, v]) => `${esc(k)} ${esc(v[0])} → ${esc(v[1])}`).join('; ')}</div>`).join('')}${motionTable(h.motion)}</div>`).join('')}
   <h3>Focus <span class="dim">${x.focus ? `${x.focus.tested} tested, ${x.focus.invisible} invisible` : ''}</span></h3>
   ${(x.focus?.results || []).map((f) => `<div class="card"><b>${name(f.target)}</b> ${f.visible ? '' : '<span class="bad">invisible</span>'} ${f.browser_default_ring ? '<span class="dim">browser default ring</span>' : ''}<div>${f.media.map(img).join('')}</div><div class="dim">${Object.entries(f.style_changes).map(([k, v]) => `${esc(k)} ${esc(v[0])} → ${esc(v[1])}`).join('; ')}</div></div>`).join('')}
-  <h3>Reduced motion</h3>${x.reduced_motion ? `<p>${x.reduced_motion.still_moving ?? '?'} of ${x.reduced_motion.animations_on_load ?? '?'} animations on load still move with reduced motion on.</p>${motionTable(x.reduced_motion.examples)}` : '<p class="dim">not checked</p>'}
+  <h3>Reduced motion</h3>${x.reduced_motion ? `<p>${x.reduced_motion.still_moving ?? '?'} of ${x.reduced_motion.animations_on_load ?? '?'} animations on load still move with reduced motion on${x.reduced_motion.still_fading ? `; ${x.reduced_motion.still_fading} more only fade or change colour, which reduced motion allows` : ''}.</p>${motionTable(x.reduced_motion.examples)}` : '<p class="dim">not checked</p>'}
   <h3>Phone</h3>${x.phone ? `<p>${esc(x.phone.device)} ${esc((x.phone.viewport || []).join('×'))}; overflow ${esc(x.phone.horizontal_overflow_px)}px${x.phone.hover_only_controls?.length ? `; only reachable by hover: ${esc(x.phone.hover_only_controls.join(', '))}` : ''}</p><div class="phone">${img(x.phone.screenshot)}</div>` : '<p class="dim">not checked</p>'}
   </section>`
   const recipe = (x) => `<section><h2>Recipe: ${esc(x.name)}</h2>${x.steps.map((s) => `<div class="card"><b>${esc(s.do)} ${esc(s.label || s.selector || '')}</b> ${s.error ? `<span class="bad">${esc(s.error)}</span>` : ''} <span class="dim">${esc(s.settle_ms)}ms</span>${s.frames ? `<div class="frames">${s.frames.map((f) => img(f.image)).join('')}</div>` : ''}${motionTable(s.motion)}${img(s.screenshot)}</div>`).join('')}</section>`

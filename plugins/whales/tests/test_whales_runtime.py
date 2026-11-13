@@ -108,6 +108,14 @@ class TestRecipes:
         assert [r["name"] for r in rt.load_recipes(str(tmp_path), ["/settings", "/book"])] == ["b-book", "c-settings", "a-home"]
         assert [r["name"] for r in rt.load_recipes(str(tmp_path))] == ["a-home", "b-book", "c-settings"]
 
+    def test_a_turn_route_with_a_query_still_puts_its_page_first(self, tmp_path):
+        for name, route in (("a-book", "/book"), ("b-empty", "/?empty=1")):
+            write(tmp_path / ".whales" / "recipes" / f"{name}.json", json.dumps({"route": route, "steps": [{"do": "wait"}]}))
+        assert [r["name"] for r in rt.load_recipes(str(tmp_path), ["/?fail=1"])] == ["b-empty", "a-book"]
+
+    def test_the_budget_fits_inside_the_kill_and_the_lock(self):
+        assert rt.BUDGET_MS / 1000 < rt.HARD_KILL_SECONDS < rt.LOCK_STALE_SECONDS
+
 
 class TestRunCapture:
     def test_no_dev_server_is_a_status_not_an_error(self, tmp_path, monkeypatch):
