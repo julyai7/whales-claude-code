@@ -4,6 +4,9 @@
 // and Web Animation the moment it starts, with exact timing and keyframes,
 // relative to the current interaction's start. Motion driven by JavaScript is
 // not listed by the browser, so `sample` reads chosen styles every frame.
+// Animations on pseudo-elements count too: a View Transition runs entirely on
+// ::view-transition-* pseudo-elements of <html>, and a skeleton's shimmer often
+// on ::after. The element's own getAnimations() leaves those out.
 (() => {
   if (window.__whalesCap) return
   const W = (window.__whalesCap = { t0: performance.now(), rows: [], seen: new WeakSet(), hold: false, held: [] })
@@ -45,6 +48,7 @@
       kind: anim.constructor.name, // CSSAnimation | CSSTransition | Animation (JS)
       name,
       target: describe(eff.target),
+      pseudo: eff.pseudoElement || null, // e.g. ::view-transition-group(page), ::after
       start_ms: Math.round(performance.now() - W.t0),
       duration_ms: typeof t.duration === 'number' ? Math.round(t.duration * 1000) / 1000 : t.duration,
       delay_ms: t.delay,
@@ -61,13 +65,17 @@
   for (const ev of ['animationstart', 'transitionrun']) {
     document.addEventListener(ev, (e) => {
       const el = e.target
-      const anims = el.getAnimations ? el.getAnimations() : []
+      const pseudo = e.pseudoElement || null
+      // subtree: true is what lists the element's pseudo-element animations; keep only this event's own.
+      const anims = el.getAnimations
+        ? el.getAnimations({ subtree: !!pseudo }).filter((a) => a.effect?.target === el && (a.effect.pseudoElement || null) === pseudo)
+        : []
       anims.forEach((a) => record(a, ev))
       // Already over (reduced motion's 0.001ms, say): keep what the event itself says.
       if (!anims.length && el.nodeType === 1) {
-        const cs = getComputedStyle(el)
+        const cs = getComputedStyle(el, pseudo)
         W.rows.push({
-          kind: 'event-only', name: e.animationName || e.propertyName, target: describe(el),
+          kind: 'event-only', name: e.animationName || e.propertyName, target: describe(el), pseudo,
           start_ms: Math.round(performance.now() - W.t0),
           duration_ms: e.animationName ? cs.animationDuration : cs.transitionDuration,
           curve: e.animationName ? cs.animationTimingFunction : cs.transitionTimingFunction,

@@ -46,8 +46,10 @@ STATUS_FILE = os.path.join(CONFIG_DIR, "runtime_status.json")
 RUNTIME_SRC = os.path.join(os.path.dirname(HERE), "runtime")
 RUNTIME_FILES = ("package.json", "package-lock.json", "recorder.js", "capture.mjs")
 
-BUDGET_MS = 80_000          # the capture's own time budget
-HARD_KILL_SECONDS = 120     # then it is killed, whatever it is doing
+# The capture runs detached after the turn, so nobody waits on it. 80s covered two pages of a motion-heavy app and
+# none of its recipes (a real redesign, Nov 10); 150s covers three pages with their recipes.
+BUDGET_MS = 150_000         # the capture's own time budget
+HARD_KILL_SECONDS = 200     # then it is killed, whatever it is doing
 INSTALL_SECONDS = 300  # each install step; a failed download must not hang for long
 LOCK_STALE_SECONDS = 300
 MAX_ROUTES = 3
@@ -375,8 +377,9 @@ def load_recipes(top: str, routes: list | None = None) -> list:
         if isinstance(recipe, dict) and isinstance(recipe.get("steps"), list):
             recipe.setdefault("name", os.path.splitext(name)[0])
             out.append(recipe)
-    on_route = set(routes or [])
-    out.sort(key=lambda r: str(r.get("route", "/")).split("?")[0] not in on_route)
+    # A recipe on one of this turn's routes first, matched by page: '/?empty=1' is a state of '/'.
+    on_page = {str(r).split("?")[0] for r in routes or []}
+    out.sort(key=lambda r: str(r.get("route", "/")).split("?")[0] not in on_page)
     return out
 
 
