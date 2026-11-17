@@ -60,6 +60,28 @@ Re-submitting a revision for the same product is also how the system learns:
 the diff against your previous submission becomes a real signal about what they
 actually changed, with no extra step from anyone.
 
+## After you build something that only shows when someone acts
+
+After a turn that changes UI, whales opens the running dev server in a hidden
+browser and records the motion, hover, focus and scroll it can reach on its
+own. It cannot open a modal, step through a flow or submit a form. When you
+built one of those, write a recipe so the next capture reaches it:
+`.whales/recipes/<name>.json` with a `route` and `steps`. Each step has `do`
+(`click`, `hover`, `fill` with `text`, `press` with `key`, `scroll` with `y`,
+`wait` with `ms`, or `goto` with `route`), a `selector`, an optional short
+`label`, and `"frames": true` on a step whose transition matters.
+
+```json
+{"route": "/book", "steps": [
+  {"do": "click", "selector": "[data-test=next]", "label": "next", "frames": true},
+  {"do": "fill", "selector": "input[name=email]", "text": "a@example.com"},
+  {"do": "click", "selector": "button[type=submit]", "label": "submit", "frames": true}
+]}
+```
+
+Use selectors that survive a restyle (roles, labels, `data-` attributes), not
+utility classes. Tell the designer in one line that you added it.
+
 ## When they react to a design you built
 
 This is for a design you built and submitted with `submit_design` in this
