@@ -1510,3 +1510,60 @@ def test_a_gateway_that_does_not_answer_never_holds_up_the_prompt(monkeypatch):
         raise wh.urllib.error.URLError("down")
     monkeypatch.setattr(wh.urllib.request, "urlopen", down)
     assert wh.pending_question("https://gw", "tok", "cc:s1", "hi") == ""
+
+
+class TestDetachedRunsInAFreshProcess:
+    """JUL-1173 / issue #32: a forked child that never execs segfaults on macOS
+    the moment it resolves a host name, if the hook already used the network
+    (0.8.0's session-start and pending-question calls). Every upload from
+    those events died silently. The detached send must be a new interpreter."""
+
+    def test_the_job_runs_in_a_new_process_without_forking(self, tmp_path, monkeypatch):
+        import functools
+        import time
+
+        def no_fork():
+            raise AssertionError("run_detached must not fork")
+        monkeypatch.setattr(os, "fork", no_fork, raising=False)
+        out = tmp_path / "ran.json"
+        wh.run_detached(functools.partial(wh._write_json, str(out), {"pid_parent": os.getpid()}))
+        deadline = time.time() + 15
+        while not out.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert json.loads(out.read_text()) == {"pid_parent": os.getpid()}
+
+    def test_a_closure_cannot_cross_to_a_new_process_so_it_runs_here(self, monkeypatch):
+        def no_spawn(*a, **k):
+            raise AssertionError("a closure must not be spawned")
+        monkeypatch.setattr(wh.subprocess, "Popen", no_spawn)
+        ran = []
+        wh.run_detached(lambda: ran.append("work"))
+        assert ran == ["work"]
+
+    def test_when_no_process_can_start_the_fallback_sends_here(self, monkeypatch):
+        import functools
+
+        def cannot_spawn(*a, **k):
+            raise OSError("no interpreter")
+        monkeypatch.setattr(wh.subprocess, "Popen", cannot_spawn)
+        ran = []
+        monkeypatch.setattr(wh, "release_upload_lock", lambda lock: ran.append(("released", lock)))
+        wh.run_detached(functools.partial(wh.release_upload_lock, "detached"),
+                        fallback=functools.partial(wh.release_upload_lock, "inline"))
+        assert ran == [("released", "inline")]
+
+    def test_a_bad_job_is_dropped_quietly(self):
+        done = subprocess.run([sys.executable, str(HOOK), "--job"], input=b"not a pickle",
+                              capture_output=True, timeout=30)
+        assert done.returncode == 0
+        assert done.stderr == b""
+
+    def test_post_detached_hands_deliver_its_whole_job(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(wh, "run_detached", lambda work, fallback=None: seen.append((work, fallback)))
+        wh.post_detached("https://g", "tok", b"{}", "s1", 10, "/t.jsonl", chunk_start=0,
+                         lock="L", drain_to=("claude_code_hook", "cc:s1"), screen={"kind": "x"})
+        [(work, fallback)] = seen
+        assert wh._job_spec(work) == ("deliver", ("https://g", "tok", b"{}", "s1", 10, "/t.jsonl", 0, "L",
+                                                  ("claude_code_hook", "cc:s1")), {"screen": {"kind": "x"}})
+        assert wh._job_spec(fallback)[2] == {}, "the inline fallback never waits on a screen upload"
