@@ -45,11 +45,13 @@ closed from the server side by any transport choice.
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import hashlib
 import importlib.util
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -636,51 +638,72 @@ def deliver(url: str, token: str, body: bytes, session_id: str, new_offset,
 def post_detached(url: str, token: str, body: bytes, session_id: str = "",
                   new_offset=None, transcript_path: str = "", chunk_start=None,
                   lock=None, drain_to=None, screen=None) -> None:
-    """Deliver in a detached grandchild so the hook returns immediately.
+    """Deliver in a detached process so the hook returns immediately.
 
-    Double-fork so the intermediate child exits at once and the grandchild is
-    reparented to init — otherwise the editor could still be waiting on a
-    process it did not know it spawned. On any platform without fork we fall
-    back to a short blocking send, which is still bounded by the timeout.
+    The process is a fresh interpreter in its own session, so the editor is
+    never left waiting on a process it did not know it spawned. If one cannot
+    be started we fall back to a short blocking send, which is still bounded
+    by the timeout.
     """
     job = (url, token, body, session_id, new_offset, transcript_path, chunk_start, lock, drain_to)
-    run_detached(lambda: deliver(*job, screen=screen), fallback=lambda: deliver(*job))
+    run_detached(functools.partial(deliver, *job, screen=screen),
+                 fallback=functools.partial(deliver, *job))
+
+
+def _job_spec(work):
+    """``(name, args, kwargs)`` for ``work`` when it is a module-level
+    function of this file, or a ``functools.partial`` of one; else None."""
+    func, args, kwargs = work, (), {}
+    if isinstance(work, functools.partial):
+        func, args, kwargs = work.func, work.args, work.keywords or {}
+    name = getattr(func, "__name__", "")
+    if not name or globals().get(name) is not func:
+        return None
+    return name, tuple(args), dict(kwargs)
 
 
 def run_detached(work, fallback=None) -> None:
-    """Run ``work`` in a detached grandchild and return at once.
+    """Run ``work`` in a detached process of its own and return at once.
 
-    Double-fork so the intermediate child exits at once and the grandchild is
-    reparented to init. Without fork, ``fallback`` (or ``work``) runs here,
-    still bounded by the send timeout.
+    A fresh interpreter, not a fork. A forked child that never execs cannot
+    resolve a host name on macOS: ``getaddrinfo`` takes it into the Network
+    framework, which is not fork-safe, and the child dies with SIGSEGV
+    ("Python quit unexpectedly") before the upload is sent. So the job —
+    ``work`` must be a module-level function of this file or a
+    ``functools.partial`` of one, never a closure — is pickled to the child's
+    stdin and run by ``--job``. If no child can be started, ``fallback`` (or
+    ``work``) runs here, still bounded by the send timeout.
     """
     fallback = fallback or work
-    if not hasattr(os, "fork"):
+    spec = _job_spec(work)
+    if spec is None:
         fallback()
         return
     try:
-        if os.fork() != 0:
-            return  # parent: done, hook exits now; the grandchild owns the lock
-    except OSError:
+        payload = pickle.dumps(spec, protocol=pickle.HIGHEST_PROTOCOL)
+        child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--job"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001 — no interpreter, no fork: send here instead
         fallback()
         return
     try:
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-    except OSError:
-        pass
+        child.stdin.write(payload)
+        child.stdin.close()
+    except (OSError, ValueError):
+        fallback()
+
+
+def run_job() -> int:
+    """The child side of ``run_detached``: one job from stdin, run to the end."""
     try:
-        devnull = os.open(os.devnull, os.O_RDWR)
-        os.dup2(devnull, 0)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-    except OSError:
-        pass
-    try:
-        work()
-    finally:
-        os._exit(0)
+        name, args, kwargs = pickle.load(sys.stdin.buffer)
+        func = globals().get(name)
+    except Exception:  # noqa: BLE001 — a bad job is dropped, never reported
+        return 0
+    if callable(func):
+        func(*args, **kwargs)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -865,20 +888,24 @@ def send_memory_snapshot(event: dict, token: str, session_key, sent_at: str) -> 
     if not bodies:
         return
     manifest = {name: digest for name, (_text, digest, _mtime) in files.items()}
+    run_detached(functools.partial(deliver_memory_snapshot, token, bodies, state_path, state,
+                                   project, manifest))
 
-    def work():
-        url = gateway_url()
-        for body in bodies:
-            ok, status, reason, stored = _send_snapshot(url, token, body)
-            record_send_result(ok, status, reason)
-            if not ok:
-                return
-            if not stored:
-                _write_json(state_path, {**state, "unconfirmed_at": time.time()})
-                return
-        _write_json(state_path, {"project": project, "manifest": manifest})
 
-    run_detached(work)
+def deliver_memory_snapshot(token: str, bodies: list, state_path: str, state: dict,
+                            project: str, manifest: dict) -> None:
+    """Ship one memory snapshot, every part in order; the state moves only
+    once all of it was stored. Runs detached (see ``run_detached``)."""
+    url = gateway_url()
+    for body in bodies:
+        ok, status, reason, stored = _send_snapshot(url, token, body)
+        record_send_result(ok, status, reason)
+        if not ok:
+            return
+        if not stored:
+            _write_json(state_path, {**state, "unconfirmed_at": time.time()})
+            return
+    _write_json(state_path, {"project": project, "manifest": manifest})
 
 
 # ---------------------------------------------------------------------------
@@ -2077,7 +2104,12 @@ def main() -> int:
                         help="with --backfill: every project's sessions, not just this directory's")
     parser.add_argument("--from-start", action="store_true",
                         help="with --backfill: ignore stored offsets and re-ship from the beginning")
+    parser.add_argument("--job", action="store_true",
+                        help="run one detached job read from stdin (see run_detached), then exit")
     args = parser.parse_args()
+
+    if args.job:
+        return run_job()
 
     if args.backfill:
         return backfill(args.since, args.from_start, all_projects=args.all_projects)
