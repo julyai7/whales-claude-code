@@ -481,3 +481,27 @@ def test_an_oversized_image_fails_with_an_image_message(monkeypatch, tmp_path, c
     err = capsys.readouterr()
     text = err.out + err.err
     assert "once bundled" not in text and "Export a smaller copy" in text
+
+
+def test_a_page_upload_keeps_the_bundled_page_beside_it_for_the_designer(monkeypatch, tmp_path, config, capsys):
+    """JUL-869: the copy whales checked had every picture built in; the file the designer opened loaded them from
+    `assets/`, and the app showed it without them."""
+    monkeypatch.setattr(critique_source.urllib.request, "urlopen",
+                        lambda req, timeout: _Response(json.dumps({"source_id": "b" * 32 + ".html"}).encode()))
+    page = _page(tmp_path, '<img src="hero.png">', {"hero.png": PNG})
+    original = open(page).read()
+    critique_source.upload(page)
+    out = json.loads(capsys.readouterr().out)
+    assert out["standalone"] == str(tmp_path / "page.standalone.html")
+    assert _data(PNG) in open(out["standalone"]).read()
+    assert open(page).read() == original, "the designer's own file is never touched"
+
+
+def test_bundle_writes_the_self_contained_copy_without_uploading(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(critique_source.urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("bundle must not upload"))
+    page = _page(tmp_path, '<img src="hero.png">', {"hero.png": PNG})
+    critique_source.bundle(page, str(tmp_path / "out.html"))
+    out = json.loads(capsys.readouterr().out)
+    assert out["standalone"] == str(tmp_path / "out.html") and out["bundled"] == ["hero.png"]
+    assert critique_source.standalone_path("/x/index.whales.standalone.html") == "/x/index.whales.standalone.html"
