@@ -578,7 +578,7 @@ def test_a_rejected_token_sends_events_without_re_sending_the_transcript(tmp_pat
 
 def _serve(status):
     """A local gateway that answers the event upload with ``status`` and keeps
-    the body it received. The prompt's product question gets an empty answer."""
+    the body it received. The prompt's product question and turn context get empty answers."""
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -588,7 +588,7 @@ def _serve(status):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
-            if self.path.endswith("/hooks/pending-question"):
+            if self.path.endswith(("/hooks/pending-question", "/hooks/context")):
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"{}")
@@ -1496,6 +1496,7 @@ def test_a_product_question_whales_has_reaches_the_agent_on_the_next_prompt(tmp_
     monkeypatch.setattr(wh, "post_detached", lambda *a, **k: None)
     monkeypatch.setattr(wh, "pending_question", lambda url, token, key, prompt: asked.append((key, prompt))
                         or "Are you now working on Stuut, or still on Matterhaul?")
+    monkeypatch.setattr(wh, "turn_context", lambda url, token, key, prompt: "")
     monkeypatch.setattr(sys, "argv", ["whales_hook.py", "--event", "UserPromptSubmit"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "s1", "prompt": "now the Stuut invoices page"})))
     assert wh.main() == 0
@@ -1510,3 +1511,66 @@ def test_a_gateway_that_does_not_answer_never_holds_up_the_prompt(monkeypatch):
         raise wh.urllib.error.URLError("down")
     monkeypatch.setattr(wh.urllib.request, "urlopen", down)
     assert wh.pending_question("https://gw", "tok", "cc:s1", "hi") == ""
+
+
+# --- turn context (whales_test decision records, part 7) ----------------------------------------------------------
+
+def test_turn_context_rides_with_the_product_question_and_waits_for_the_slower_only(monkeypatch):
+    import time as _time
+
+    def slow(answer):
+        def call(url, token, key, prompt):
+            _time.sleep(0.4)
+            return answer
+        return call
+
+    monkeypatch.delenv("WHALES_CONTEXT", raising=False)
+    monkeypatch.setattr(wh, "pending_question", slow("Which product is this?"))
+    monkeypatch.setattr(wh, "turn_context", slow("# whales: this designer's judgment for this prompt"))
+    started = _time.monotonic()
+    out = wh.prompt_context("https://gw", "tok", "cc:s1", "add a hover state")
+    assert _time.monotonic() - started < 0.75, "the two calls run at once"
+    assert out == "Which product is this?\n\n# whales: this designer's judgment for this prompt"
+
+
+def test_turn_context_off_or_empty_leaves_the_question_alone(monkeypatch):
+    called = []
+    monkeypatch.setattr(wh, "pending_question", lambda *a: "")
+    monkeypatch.setattr(wh, "turn_context", lambda *a: called.append(a) or "ctx")
+    monkeypatch.setenv("WHALES_CONTEXT", "off")
+    assert wh.prompt_context("https://gw", "tok", "cc:s1", "x") == "" and called == []
+    monkeypatch.delenv("WHALES_CONTEXT")
+    assert wh.prompt_context("https://gw", "tok", "cc:s1", "x") == "ctx"
+
+
+def test_turn_context_that_does_not_answer_never_holds_up_the_prompt(monkeypatch):
+    seen = {}
+
+    def down(request, timeout):
+        seen.update(url=request.full_url, timeout=timeout, body=json.loads(request.data))
+        raise wh.urllib.error.URLError("down")
+
+    monkeypatch.setattr(wh.urllib.request, "urlopen", down)
+    assert wh.turn_context("https://gw", "tok", "cc:s1", "hi") == ""
+    assert seen == {"url": "https://gw/hooks/context", "timeout": 3,
+                    "body": {"client_session_id": "cc:s1", "prompt": "hi"}}
+
+
+def test_a_cursor_prompt_never_asks_for_turn_context(tmp_path, monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr(wh, "CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(wh, "TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setattr(wh, "GATEWAY_FILE", str(tmp_path / "gateway"))
+    monkeypatch.setattr(wh, "STATUS_FILE", str(tmp_path / "capture_status.json"))
+    monkeypatch.setattr(wh, "OFFSET_DIR", str(tmp_path / "offsets"))
+    monkeypatch.setattr(wh, "SYNTHETIC_DIR", str(tmp_path / "synthetic"))
+    (tmp_path / "token").write_text("tok")
+    called = []
+    monkeypatch.setattr(wh, "check_for_update", lambda: None)
+    monkeypatch.setattr(wh, "post_detached", lambda *a, **k: None)
+    monkeypatch.setattr(wh, "prompt_context", lambda *a: called.append(a) or "ctx")
+    monkeypatch.setattr(sys, "argv", ["whales_hook.py", "--event", "UserPromptSubmit", "--source", "cursor_hook"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"conversation_id": "c1", "prompt": "hover state"})))
+    assert wh.main() == 0
+    assert called == []

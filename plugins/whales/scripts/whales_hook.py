@@ -1679,6 +1679,40 @@ def pending_question(url: str, token: str, session_key: str, prompt: str) -> str
         return ""
 
 
+# What the designer's agent should know for this prompt (whales_test decision records, part 7): their decided values
+# matched to it, the product's goal, priorities, rejected fixes. whales makes no model call for it, so the answer is
+# fast; past the timeout the prompt goes through without it. WHALES_CONTEXT=off turns it off; Claude Code only.
+_CONTEXT_SECONDS = 3
+
+
+def context_on() -> bool:
+    return os.environ.get("WHALES_CONTEXT", "").lower() not in ("0", "off", "false", "no")
+
+
+def turn_context(url: str, token: str, session_key: str, prompt: str) -> str:
+    """whales' context for this prompt, as markdown for the agent, or "" (nothing to add, off, or any failure)."""
+    body = json.dumps({"client_session_id": session_key, "prompt": prompt or ""}).encode()
+    request = urllib.request.Request(f"{url}/hooks/context", data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=_CONTEXT_SECONDS) as response:
+            return (json.loads(response.read() or b"{}") or {}).get("context") or ""
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return ""
+
+
+def prompt_context(url: str, token: str, session_key: str, prompt: str) -> str:
+    """The product question and the turn context, asked at once: the prompt waits for the slower of the two, not
+    both. Either one failing leaves the other."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        question = pool.submit(pending_question, url, token, session_key, prompt)
+        context = pool.submit(turn_context, url, token, session_key, prompt) if context_on() else None
+        parts = [question.result(), context.result() if context else ""]
+    return "\n\n".join(p for p in parts if p)
+
+
 def session_id_injection(event: dict, prefix: str):
     """The PreToolUse output that adds ``client_session_id`` to a whales call,
     or ``None`` when there is nothing to do.
@@ -2164,8 +2198,8 @@ def main() -> int:
         # lands while the agent works, and Stop tells the designer then.
         check_for_update()
         notice = restart_notice(session_id) or {}
-        question = (pending_question(gateway_url(), token, f"{prefix}:{session_id}",
-                                     prompt_user_text(event.get("prompt")) or str(event.get("prompt") or ""))
+        question = (prompt_context(gateway_url(), token, f"{prefix}:{session_id}",
+                                   prompt_user_text(event.get("prompt")) or str(event.get("prompt") or ""))
                     if args.event == "UserPromptSubmit" and session_id and token and state != "rejected" else "")
         if question:
             notice["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": question}
