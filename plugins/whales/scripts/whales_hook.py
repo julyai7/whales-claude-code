@@ -59,7 +59,9 @@ import urllib.request
 from datetime import datetime, timezone
 
 TIMEOUT_SECONDS = 8
-CONFIG_DIR = os.path.expanduser("~/.whales")
+# WHALES_CONFIG_DIR: another token/gateway/offsets folder, for running against a local gateway without touching the
+# designer's own ~/.whales.
+CONFIG_DIR = os.path.expanduser(os.environ.get("WHALES_CONFIG_DIR") or "~/.whales")
 TOKEN_FILE = os.path.join(CONFIG_DIR, "token")
 GATEWAY_FILE = os.path.join(CONFIG_DIR, "gateway")
 OFFSET_DIR = os.path.join(CONFIG_DIR, "offsets")
@@ -2056,6 +2058,438 @@ def restart_notice(session_id: str):
                              "Run /reload-plugins to use it now, or restart Claude Code."}
 
 
+# ---------------------------------------------------------------------------
+# The hook server ("hook-triggered, server-directed")
+#
+# Whales used to help only when the designer's agent chose to call one of its
+# tools, and agents mostly didn't. Here every session start, prompt, file
+# edit and turn end goes to the gateway's /hooks/turn/{event}, and the server
+# decides what Claude is told: a brief on design prompts, nothing otherwise.
+# Its answer is one shape (context, notice, decision, files); this script
+# turns it into Claude Code's hook JSON, merged into what each hook already
+# prints. The server answers nothing at all until it is switched on for the
+# designer (off / shadow / on, per designer, on the backend), so this costs
+# one short request while it's off. WHALES_TURN=off turns it off locally.
+# Claude Code only for now; Cursor's hooks keep today's behaviour.
+# ---------------------------------------------------------------------------
+
+# How long each event waits on the server, in seconds (the server answers
+# with what it has by then). The hook's own timeout in hooks.json is longer.
+# Stop waits longest: the server grades the turn there (one model call, a few seconds to ~30s).
+# Stop also waits on a running design check (up to ~2.5 minutes) before it grades; the wake-up waits on any job the
+# session has running. hooks.json gives each hook a little more than its deadline.
+TURN_DEADLINES = {"session_start": 6.0, "prompt": 25.0, "edit": 1.0, "image": 6.0, "stop": 200.0, "wake": 230.0}
+# Only files under this folder may be written from the server's answer.
+TURN_DIR = ".whales"
+# Token and style files a repo map lists, relative to the repo root.
+_TOKEN_GLOBS = ("tailwind.config.*", "**/theme.*", "**/tokens.*", "**/design-tokens.*", "**/*.tokens.json",
+                "src/styles/*.css", "app/globals.css", "styles/globals.css")
+_FRAMEWORKS = (("next", "Next.js"), ("@remix-run/react", "Remix"), ("nuxt", "Nuxt"), ("@sveltejs/kit", "SvelteKit"),
+               ("svelte", "Svelte"), ("vue", "Vue"), ("react-native", "React Native"), ("expo", "Expo"),
+               ("astro", "Astro"), ("react", "React"))
+_STYLING = (("tailwindcss", "Tailwind"), ("styled-components", "styled-components"), ("@emotion/react", "Emotion"),
+            ("@mui/material", "MUI"), ("@chakra-ui/react", "Chakra"), ("@radix-ui/themes", "Radix Themes"),
+            ("sass", "Sass"))
+
+
+def turn_on() -> bool:
+    return os.environ.get("WHALES_TURN", "").lower() not in ("0", "off", "false", "no")
+
+
+def turn_event(url: str, token: str, event: str, body: dict, deadline: float) -> dict:
+    """POST one event to the hook server and return its answer; ``{}`` on any failure, so the turn goes on."""
+    data = json.dumps({**body, "deadline_s": deadline}, default=str).encode("utf-8")
+    request = urllib.request.Request(f"{url}/hooks/turn/{event}", data=data, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=deadline + 1.5) as response:
+            answer = json.loads(response.read() or b"{}")
+            return answer if isinstance(answer, dict) else {}
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return {}
+
+
+def _git_out(folder: str, *args, timeout: float = 1.5) -> str:
+    try:
+        out = subprocess.run(["git", "-C", folder, *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def light_git(folder: str) -> dict:
+    """The repo's root and remote only: git_info also reads the repo's names, too slow for every prompt."""
+    root = _git_out(folder, "rev-parse", "--show-toplevel") if folder else ""
+    if not root:
+        return {}
+    return {k: v for k, v in {"root": root, "remote": _git_out(folder, "remote", "get-url", "origin")}.items() if v}
+
+
+def turn_git(folder: str, base: dict) -> dict:
+    """What the server keys a session's repo on: the session-start git info, plus branch, HEAD and a fingerprint of
+    the uncommitted changes (a new fingerprint is a new repo map)."""
+    out = dict(base or {})
+    if not folder or not out.get("root"):
+        return out
+    head = _git_out(folder, "rev-parse", "HEAD")
+    if head:
+        out["head"] = head
+        out["branch"] = _git_out(folder, "rev-parse", "--abbrev-ref", "HEAD")
+        status = _git_out(folder, "status", "--porcelain", "--untracked-files=no")
+        out["dirty"] = hashlib.sha1(status.encode("utf-8")).hexdigest()[:12] if status else ""
+    return out
+
+
+def repo_map(root: str) -> dict:
+    """A small map of the repo for the server: framework, styling and where tokens live. Quick: one package.json
+    read and a few globs, capped."""
+    if not root:
+        return {}
+    out: dict = {}
+    try:
+        with open(os.path.join(root, "package.json"), "r", encoding="utf-8") as fh:
+            pkg = json.load(fh)
+        deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+        out["framework"] = next((name for dep, name in _FRAMEWORKS if dep in deps), None)
+        out["styling"] = next((name for dep, name in _STYLING if dep in deps), None)
+        scripts = pkg.get("scripts") or {}
+        out["dev_command"] = next((f"npm run {k}" for k in ("dev", "start") if k in scripts), None)
+    except (OSError, ValueError, AttributeError):
+        pass
+    found: list = []
+    for pattern in _TOKEN_GLOBS:
+        for path in glob.glob(os.path.join(root, pattern), recursive=True)[:5]:
+            rel = os.path.relpath(path, root)
+            if "node_modules" not in rel and rel not in found:
+                found.append(rel)
+        if len(found) >= 10:
+            break
+    if found:
+        out["token_files"] = found[:10]
+    return {k: v for k, v in out.items() if v}
+
+
+def write_turn_files(folder: str, files) -> None:
+    """Write what the server sent (the overflow brief) under ``<repo>/.whales/``, and nowhere else. The folder
+    carries its own .gitignore, so it stays out of git without touching the designer's."""
+    if not folder or not isinstance(files, list):
+        return
+    base = os.path.realpath(os.path.join(folder, TURN_DIR))
+    for f in files:
+        if not isinstance(f, dict) or not isinstance(f.get("content"), str):
+            continue
+        target = os.path.realpath(os.path.join(folder, str(f.get("path") or "")))
+        if not target.startswith(base + os.sep):
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            ignore = os.path.join(base, ".gitignore")
+            if not os.path.exists(ignore):
+                with open(ignore, "w", encoding="utf-8") as fh:
+                    fh.write("*\n")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write(f["content"])
+        except OSError:
+            continue
+
+
+def merge_turn_answer(out: dict, answer: dict, hook_event_name: str) -> dict:
+    """Fold the server's answer into the hook's JSON: context for Claude, the one line for the designer, and a
+    block at Stop."""
+    context = answer.get("context")
+    if isinstance(context, str) and context.strip():
+        spec = out.setdefault("hookSpecificOutput", {"hookEventName": hook_event_name})
+        spec["hookEventName"] = hook_event_name
+        spec["additionalContext"] = "\n\n".join(t for t in (spec.get("additionalContext"), context) if t)
+    notice = answer.get("notice")
+    if isinstance(notice, str) and notice.strip() and "systemMessage" not in out:
+        out["systemMessage"] = notice
+    decision = answer.get("decision") or {}
+    if hook_event_name == "Stop" and isinstance(decision, dict) and decision.get("block") and decision.get("reason"):
+        out["decision"] = "block"
+        out["reason"] = str(decision["reason"])
+    return out
+
+
+def edit_kind(path: str) -> str:
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        return "image"
+    if ext in (".html", ".htm"):
+        return "page"
+    return "code"
+
+
+def prompt_event_id(session_id: str, prompt: str, transcript_path: str) -> str:
+    """The same prompt hook fired twice (a retry) has the same id; the same words sent again later don't, because
+    the transcript has grown."""
+    try:
+        size = os.path.getsize(transcript_path) if transcript_path else 0
+    except OSError:
+        size = 0
+    return hashlib.sha1(f"{session_id}\0{prompt}\0{size}".encode("utf-8")).hexdigest()[:32]
+
+
+def diff_stat(folder: str) -> str:
+    return _git_out(folder, "diff", "--stat", "HEAD", timeout=2.0)[-4000:] if folder else ""
+
+
+
+
+# --- what the Stop-loop grader judges: the diff, new files and screenshots of this turn --------------------------
+
+_MAX_TURN_DIFF = 30_000
+_MAX_NEW_FILE_CHARS = 8_000
+_MAX_NEW_FILES = 5
+# Screenshots sent with a stop: the newest two, each at most this size (the judge looks at them).
+_MAX_SHOTS = 2
+_MAX_SHOT_BYTES = 2_500_000
+_MAX_TRANSCRIPT_SCAN = 4_000_000
+_IMAGE_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+_IMAGE_PATH = re.compile(r"""(?:^|[\s'"=(])((?:~|/|\.{1,2}/)?[\w@%+.,/-]*[\w-]\.(?:png|jpe?g|webp))\b""", re.I)
+_SHOT_WORDS = re.compile(r"screenshot|screencapture|page\.screenshot|playwright", re.I)
+_SKIP_DIRS = {"node_modules", ".git", ".next", "dist", "build", ".venv", "venv", "__pycache__", ".turbo",
+              "coverage", ".cache", "out", ".svelte-kit", "Pods", "DerivedData"}
+_UI_EXT = (".tsx", ".jsx", ".ts", ".js", ".mjs", ".vue", ".svelte", ".astro", ".html", ".htm", ".css", ".scss",
+           ".sass", ".less", ".mdx")
+
+
+def _grade_state_path(session_key: str) -> str:
+    return os.path.join(TURNS_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", session_key) + ".grade.json")
+
+
+def mark_turn_start(session_key: str, transcript_path: str) -> None:
+    """When the turn began and where the transcript stood: the Stop hook looks only at what came after."""
+    try:
+        offset = os.path.getsize(transcript_path) if transcript_path else 0
+    except OSError:
+        offset = 0
+    _write_json(_grade_state_path(session_key), {"at": time.time(), "offset": offset})
+
+
+def _transcript_since(transcript_path: str, offset: int) -> list:
+    """The transcript's entries written this turn (parsed JSON lines), capped."""
+    if not transcript_path:
+        return []
+    try:
+        size = os.path.getsize(transcript_path)
+        start = offset if 0 <= offset <= size else 0
+        start = max(start, size - _MAX_TRANSCRIPT_SCAN)
+        with open(transcript_path, "rb") as fh:
+            fh.seek(start)
+            raw = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in raw.splitlines():
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+def _blocks(entry: dict) -> list:
+    content = (entry.get("message") or {}).get("content") if isinstance(entry, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def screenshots_in_transcript(entries: list, folder: str) -> tuple:
+    """``(tools, paths)``: screenshot tools Claude ran or images it looked at this turn, and image files named."""
+    tools, paths = [], []
+    for entry in entries:
+        for block in _blocks(entry):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = str(block.get("name") or "")
+                args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                text = json.dumps(args)
+                if re.search(r"screenshot", name, re.I) or str(args.get("action") or "") == "screenshot":
+                    tools.append(name)
+                elif name == "Bash" and _SHOT_WORDS.search(str(args.get("command") or "")):
+                    tools.append("Bash: " + str(args.get("command") or "")[:120])
+                elif name == "Read" and os.path.splitext(str(args.get("file_path") or ""))[1].lower() in _IMAGE_EXT:
+                    tools.append("Read " + str(args.get("file_path")))
+                for m in _IMAGE_PATH.finditer(text.replace("\\/", "/")):
+                    path = os.path.expanduser(m.group(1))
+                    paths.append(path if os.path.isabs(path) else os.path.join(folder or "", path))
+            elif block.get("type") == "tool_result":
+                inner = block.get("content") if isinstance(block.get("content"), list) else []
+                if any(isinstance(b, dict) and b.get("type") == "image" for b in inner):
+                    tools.append("image returned to Claude")
+    return list(dict.fromkeys(tools)), list(dict.fromkeys(paths))
+
+
+def recent_images(root: str, since: float, limit_entries: int = 4000) -> list:
+    """Image files under the repo written since the turn began (a quick, capped walk)."""
+    found, seen = [], 0
+    if not root or not os.path.isdir(root):
+        return found
+    base_depth = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        if dirpath.count(os.sep) - base_depth >= 4:
+            dirnames[:] = []
+        for name in filenames:
+            seen += 1
+            if os.path.splitext(name)[1].lower() in _IMAGE_EXT:
+                path = os.path.join(dirpath, name)
+                try:
+                    if os.path.getmtime(path) >= since:
+                        found.append(path)
+                except OSError:
+                    pass
+        if seen > limit_entries:
+            break
+    return found
+
+
+def _encode_shots(paths: list, since: float) -> list:
+    """The newest images written this turn, base64, for the grader to look at."""
+    import base64
+
+    fresh = []
+    for path in dict.fromkeys(paths):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if st.st_mtime >= since - 5 and os.path.splitext(path)[1].lower() in _IMAGE_EXT:
+            fresh.append((st.st_mtime, st.st_size, path))
+    out = []
+    for _, size, path in sorted(fresh, reverse=True)[:_MAX_SHOTS]:
+        shot = {"path": path, "media_type": _IMAGE_EXT[os.path.splitext(path)[1].lower()], "data": None}
+        if size <= _MAX_SHOT_BYTES:
+            try:
+                with open(path, "rb") as fh:
+                    shot["data"] = base64.b64encode(fh.read()).decode("ascii")
+            except OSError:
+                pass
+        out.append(shot)
+    return out
+
+
+def new_files_diff(root: str, since: float) -> tuple:
+    """``(paths, diff)`` for untracked files created this turn: ``git diff HEAD`` doesn't show them."""
+    listed = _git_out(root, "ls-files", "--others", "--exclude-standard", timeout=2.0)
+    paths, parts = [], []
+    for rel in listed.splitlines()[:500]:
+        path = os.path.join(root, rel)
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+        except OSError:
+            continue
+        paths.append(path)
+        if len(parts) < _MAX_NEW_FILES and rel.lower().endswith(_UI_EXT):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    text = fh.read(_MAX_NEW_FILE_CHARS)
+            except OSError:
+                continue
+            body = "".join(f"+{line}\n" for line in text.splitlines())
+            parts.append(f"diff --git a/{rel} b/{rel}\nnew file\n--- /dev/null\n+++ b/{rel}\n{body}")
+    return paths[:50], "".join(parts)
+
+
+def stop_evidence(session_key: str, folder: str, transcript_path: str) -> dict:
+    """The diff and evidence a Stop sends: what the grader judges. Never raises."""
+    try:
+        state = _read_json(_grade_state_path(session_key), {})
+        since = float(state.get("at") or 0) or (time.time() - 3600)
+        root = _git_out(folder, "rev-parse", "--show-toplevel") if folder else ""
+        diff = _git_out(root, "diff", "HEAD", "--no-color", "-U2", timeout=3.0) if root else ""
+        new_paths, new_diff = new_files_diff(root, since) if root else ([], "")
+        tools, named = screenshots_in_transcript(_transcript_since(transcript_path, int(state.get("offset") or 0)),
+                                                 folder)
+        shots = _encode_shots([*named, *recent_images(root, since)], since)
+        return {"diff": (diff + new_diff)[:_MAX_TURN_DIFF],
+                "evidence": {"new_files": new_paths, "screenshot_tools": tools[:10], "screenshots": shots}}
+    except Exception:  # noqa: BLE001 — the stop goes on with what it has
+        return {}
+
+
+def _turn_call(hook_event: str, event: dict, token: str, session_key: str, folder: str, git: dict) -> dict:
+    """The hook server's answer for one of the waited-on events (session start, prompt, stop)."""
+    git = turn_git(folder, git)
+    body = {"client_session_id": session_key, "host": "claude_code", "cwd": folder or None, "git": git}
+    if hook_event == "SessionStart":
+        why = event.get("source") or "startup"
+        root = git.get("root") or ""
+        fingerprint = f"{git.get('head', '')}:{git.get('dirty', '')}" if git.get("head") else ""
+        body["event_id"] = f"start:{session_key}:{why}:{int(time.time())}"
+        body["payload"] = {"why": why, "repo_map": {"fingerprint": fingerprint, "map": repo_map(root)}}
+        return turn_event(gateway_url(), token, "session_start", body, TURN_DEADLINES["session_start"])
+    if hook_event == "UserPromptSubmit":
+        prompt = prompt_user_text(event.get("prompt")) or str(event.get("prompt") or "")
+        body["event_id"] = prompt_event_id(session_key, prompt, event.get("transcript_path") or "")
+        body["payload"] = {"prompt": prompt}
+        mark_turn_start(session_key, event.get("transcript_path") or "")
+        return turn_event(gateway_url(), token, "prompt", body, TURN_DEADLINES["prompt"])
+    body["payload"] = {"reply": str(event.get("last_assistant_message") or "")[:20_000],
+                       "diff_stat": diff_stat(folder), "continuation": bool(event.get("stop_hook_active")),
+                       **stop_evidence(session_key, folder, event.get("transcript_path") or "")}
+    return turn_event(gateway_url(), token, "stop", body, TURN_DEADLINES["stop"])
+
+
+def image_read(event: dict, token: str, session_key: str, folder: str) -> dict:
+    """A screenshot Claude opened: sent to whales (it starts measuring it on a critique turn). The hook output that
+    tells Claude where the measurements will be, or ``{}``."""
+    import base64
+
+    path = str((event.get("tool_input") or {}).get("file_path") or "")
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _IMAGE_EXT:
+        return {}
+    try:
+        if os.path.getsize(path) > _MAX_SHOT_BYTES:
+            return {}
+        with open(path, "rb") as fh:
+            data = base64.b64encode(fh.read()).decode("ascii")
+    except OSError:
+        return {}
+    body = {"client_session_id": session_key, "host": "claude_code", "cwd": folder or None,
+            "event_id": f"edit:{event.get('tool_use_id') or ''}",
+            "payload": {"tool": "Read", "file_path": path, "kind": "image", "image": data}}
+    answer = turn_event(gateway_url(), token, "edit", body, TURN_DEADLINES["image"])
+    return merge_turn_answer({}, answer, "PostToolUse") if answer else {}
+
+
+# How long the wake-up keeps waiting in all (several requests, each at most TURN_DEADLINES["wake"]); hooks.json's
+# timeout for it is a little longer. A critique of a live page can take several minutes.
+WAKE_TOTAL_S = 840.0
+
+
+def stop_wake(token: str, session_key: str, folder: str, total_s: float = WAKE_TOTAL_S) -> int:
+    """Wait on whales for this session's background jobs; when one finishes, print it and exit 2 (Claude Code wakes
+    Claude with it, even when the session is idle). Exits 0 at once when nothing is running, and when the wait runs
+    out (the next hook delivers it then)."""
+    body = {"client_session_id": session_key, "host": "claude_code", "cwd": folder or None, "event_id": ""}
+    ends = time.monotonic() + total_s
+    while True:
+        left = ends - time.monotonic()
+        if left < 10:
+            return 0
+        answer = turn_event(gateway_url(), token, "wake", body, min(TURN_DEADLINES["wake"], left - 5))
+        context = answer.get("context") if isinstance(answer, dict) else None
+        if isinstance(context, str) and context.strip():
+            sys.stderr.write(context.strip() + "\n")
+            return 2
+        if not (answer or {}).get("refs"):
+            return 0
+
+
+def _turn_result(future) -> dict:
+    if future is None:
+        return {}
+    try:
+        return future.result() or {}
+    except Exception:  # noqa: BLE001 — the turn goes on without whales
+        return {}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     # Not required: Cursor auto-discovers and runs Claude Code plugins'
@@ -2136,6 +2570,30 @@ def main() -> int:
     # hookSpecificOutput.additionalContext; Cursor reads additional_context
     # and env (see cursor_session_start_output). The wrong shape is ignored.
     git = git_info(session_folder(event)) if args.event == "SessionStart" else {}
+    # The hook server's calls run beside the existing ones (product question, product context), so their waits
+    # overlap rather than add up.
+    turn_live = (args.source == "claude_code_hook" and bool(session_id and token) and state != "rejected"
+                 and turn_on())
+    folder = session_folder(event)
+    # Claude opened a screenshot (Read of an image): during a critique, whales measures it and says where the
+    # result will be. Waited on (a few seconds), never captured.
+    if args.event == "ImageRead":
+        if turn_live:
+            out = image_read(event, token, f"{prefix}:{session_id}", folder)
+            if out:
+                print(json.dumps(out))
+        return 0
+    # The background Stop hook (asyncRewake): exit 2 wakes Claude with what finished; anything else is silent.
+    if args.event == "StopWake":
+        return stop_wake(token, f"{prefix}:{session_id}", folder) if turn_live else 0
+    turn_future = None
+    pool = None
+    if turn_live and args.event in ("SessionStart", "UserPromptSubmit", "Stop"):
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        turn_future = pool.submit(_turn_call, args.event, event, token, f"{prefix}:{session_id}", folder,
+                                  git if args.event == "SessionStart" else light_git(folder))
     product = (product_context(gateway_url(), token, f"{prefix}:{session_id}", session_folder(event), git)
                if args.event == "SessionStart" and session_id and token and state != "rejected" else "")
     if args.event == "SessionStart" and session_id and args.source == "cursor_hook":
@@ -2158,6 +2616,10 @@ def main() -> int:
                 "whales capture is failing: the gateway rejected this machine's "
                 f"token. Get a new install command from {new_token_page()} and run it."
             )
+        answer = _turn_result(turn_future)
+        if answer:
+            write_turn_files(git.get("root") or folder, answer.get("files"))
+            merge_turn_answer(out, answer, "SessionStart")
         print(json.dumps(out))
     if args.event in ("UserPromptSubmit", "Stop") and args.source == "claude_code_hook":
         # At both ends of a turn: an update started by this prompt usually
@@ -2167,10 +2629,28 @@ def main() -> int:
         question = (pending_question(gateway_url(), token, f"{prefix}:{session_id}",
                                      prompt_user_text(event.get("prompt")) or str(event.get("prompt") or ""))
                     if args.event == "UserPromptSubmit" and session_id and token and state != "rejected" else "")
-        if question:
+        answer = _turn_result(turn_future)
+        # A design turn's brief already carries the product question; don't ask it twice.
+        if question and question not in str(answer.get("context") or ""):
             notice["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": question}
+        if answer:
+            root = _git_out(folder, "rev-parse", "--show-toplevel") if folder else ""
+            write_turn_files(root or folder, answer.get("files"))
+            merge_turn_answer(notice, answer, args.event)
         if notice:
             print(json.dumps(notice))
+    if pool is not None:
+        # Joined before anything below forks (run_detached): forking with a live thread can deadlock the child.
+        pool.shutdown(wait=True)
+
+    # A file edit: sent in the background (the server only records it for now), so an edit never waits on it.
+    if turn_live and args.event == "PostToolUse":
+        edit = {"tool": event.get("tool_name"), "file_path": (event.get("tool_input") or {}).get("file_path")
+                or (event.get("tool_input") or {}).get("notebook_path")}
+        edit["kind"] = edit_kind(edit["file_path"] or "")
+        body = {"client_session_id": f"{prefix}:{session_id}", "host": "claude_code", "cwd": folder,
+                "event_id": f"edit:{event.get('tool_use_id') or ''}", "payload": edit}
+        run_detached(lambda: turn_event(gateway_url(), token, "edit", body, TURN_DEADLINES["edit"]))
 
     if not token:
         return 0  # capture off, or not connected yet — either way, nothing to send
