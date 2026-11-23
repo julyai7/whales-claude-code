@@ -3,14 +3,19 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume",
+        "matcher": "startup|resume|clear|compact",
         "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
             "args": ["--event", "SessionStart"],
-            "timeout": 10
-          },
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_update.py",
@@ -40,7 +45,8 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
             "args": ["--event", "UserPromptSubmit"],
-            "timeout": 10
+            "timeout": 30,
+            "statusMessage": "whales…"
           }
         ]
       }
@@ -53,6 +59,17 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
             "args": ["--event", "PostToolUse"],
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
+            "args": ["--event", "ImageRead"],
             "timeout": 10
           }
         ]
@@ -77,7 +94,19 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
             "args": ["--event", "Stop"],
-            "timeout": 10
+            "timeout": 240,
+            "statusMessage": "whales: checking…"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/whales_hook.py",
+            "args": ["--event", "StopWake"],
+            "asyncRewake": true,
+            "timeout": 900
           }
         ]
       }
