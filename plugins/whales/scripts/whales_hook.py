@@ -89,7 +89,7 @@ SESSION_ID_TOOLS = frozenset({
     "search_design_history", "submit_design", "record_critique", "record_approval",
     "universal_critique", "list_design_systems", "get_design_system",
     "register_design_system", "generate_design_system", "extract_figma",
-    "product_context", "self_critique", "set_session_product",
+    "product_context", "self_critique", "set_session_product", "whales_autopilot",
 })
 
 # A rejected credential, as opposed to a gateway that is down or unreachable.
@@ -2515,6 +2515,135 @@ def _turn_result(future) -> dict:
         return future.result() or {}
     except Exception:  # noqa: BLE001 — the turn goes on without whales
         return {}
+# --- Whales Autopilot ---------------------------------------------------------
+# A run moves only when the host calls whales_autopilot(action=next). These keep
+# it moving between turns: at Stop, when the run has a move waiting for the
+# host, the turn is sent back; on a prompt, when it waits on the designer, its
+# questions reach the agent. Claude Code only.
+#
+# Only a session that has called whales_autopilot ever checks: the PreToolUse
+# for that tool writes a marker, and without the marker nothing here touches
+# the network. Every other designer's Stop costs one stat().
+AUTOPILOT_DIR = os.path.join(CONFIG_DIR, "autopilot")
+AUTOPILOT_TOOL = "whales_autopilot"
+_AUTOPILOT_SECONDS = 2
+# Consecutive Stop blocks for one run before the hook lets the turn end: a
+# model that will not call next must not be looped forever.
+_AUTOPILOT_MAX_BLOCKS = 3
+_AUTOPILOT_ENDED = ("done", "failed", "stopped")
+
+
+def _autopilot_marker(session_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "unknown")
+    return os.path.join(AUTOPILOT_DIR, f"{safe}.json")
+
+
+# A marker older than this is a run whose end was never seen (the gateway unreachable at every check since): the
+# hook server comes back rather than staying out of the session for good.
+_AUTOPILOT_MARKER_MAX_AGE_S = 24 * 3600
+
+
+def autopilot_running(session_id: str) -> bool:
+    """This session has a Whales Autopilot run going: the hook server stays out of it (no brief, no ask to proceed, no
+    Stop grading, no wake-ups), so autopilot alone directs the agent. One stat(); the marker goes when the run ends."""
+    if not session_id:
+        return False
+    try:
+        return time.time() - os.path.getmtime(_autopilot_marker(session_id)) < _AUTOPILOT_MARKER_MAX_AGE_S
+    except OSError:
+        return False
+
+
+def note_autopilot_call(event: dict) -> None:
+    """PreToolUse on whales_autopilot: mark this session as running autopilot.
+    The agent acting on the run also resets the Stop-block count."""
+    session_id = event.get("session_id") or ""
+    if not session_id or _bare_tool(event.get("tool_name") or "") != AUTOPILOT_TOOL:
+        return
+    path = _autopilot_marker(session_id)
+    _write_json(path, {"run_id": _read_json(path, {}).get("run_id"), "blocks": 0})
+
+
+def autopilot_check(url: str, token: str, session_key: str):
+    """The gateway's SessionCheck for this session, or ``None`` on any failure."""
+    from urllib.parse import quote
+
+    request = urllib.request.Request(
+        f"{url}/hooks/autopilot?client_session_id={quote(session_key, safe='')}",
+        headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=_AUTOPILOT_SECONDS) as response:
+            check = json.loads(response.read() or b"{}")
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return None
+    return check if isinstance(check, dict) else None
+
+
+def autopilot_output(event_name: str, event: dict, session_id: str, prefix: str) -> dict:
+    """What autopilot adds to this Stop or UserPromptSubmit answer: ``{}``, a
+    Stop block, or ``hookSpecificOutput.additionalContext``. Fail-open: any
+    error, and the turn goes on as if autopilot were not there."""
+    if event_name not in ("Stop", "UserPromptSubmit") or not session_id:
+        return {}
+    path = _autopilot_marker(session_id)
+    if not os.path.isfile(path):
+        return {}
+    if event_name == "Stop" and event.get("stop_hook_active"):
+        return {}
+    token = _read(TOKEN_FILE)
+    if not token:
+        return {}
+    check = autopilot_check(gateway_url(), token, f"{prefix}:{session_id}")
+    if check is None:
+        return {}
+    if check.get("status") in _AUTOPILOT_ENDED:
+        try:
+            os.remove(path)  # nothing left to wait for: the next Stop makes no call
+        except OSError:
+            pass
+        return {}
+    state = _read_json(path, {})
+    run_id = str(check.get("run_id") or "")
+    try:
+        blocks = int(state.get("blocks") or 0) if state.get("run_id") == run_id else 0
+    except (TypeError, ValueError):
+        blocks = 0
+    out: dict = {}
+    if not check.get("waiting_host"):
+        blocks = 0
+    elif event_name == "Stop" and blocks < _AUTOPILOT_MAX_BLOCKS:
+        blocks += 1
+        out = {"decision": "block",
+               "reason": f"Whales autopilot run {run_id} has a move waiting. Call whales_autopilot with "
+                         "action=next (follow the whales-autopilot skill)."}
+    if event_name == "UserPromptSubmit" and check.get("waiting_person"):
+        lines = [f"Whales autopilot run {run_id} is waiting on the designer:"]
+        for q in check.get("questions") or []:
+            if isinstance(q, dict) and q.get("question"):
+                lines.append(f"- {q['question']}")
+        lines.append("If this message answers them, answer with whales_autopilot steer kind=answer "
+                     "(one call per question, their words as text); otherwise ask them.")
+        out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                      "additionalContext": "\n".join(lines)}}
+    _write_json(path, {"run_id": run_id, "blocks": blocks})
+    return out
+
+
+def merge_autopilot(notice: dict, extra: dict) -> dict:
+    """Fold autopilot's output into the hook's own answer: one JSON object per
+    firing, with any additionalContext already there kept."""
+    if not extra:
+        return notice
+    notice = dict(notice)
+    for key, value in extra.items():
+        if key == "hookSpecificOutput" and isinstance(notice.get(key), dict):
+            merged = dict(notice[key])
+            merged["additionalContext"] = "\n\n".join(
+                t for t in (merged.get("additionalContext"), value.get("additionalContext")) if t)
+            notice[key] = merged
+        else:
+            notice[key] = value
+    return notice
 
 
 def main() -> int:
@@ -2574,6 +2703,7 @@ def main() -> int:
         if args.source == "claude_code_hook":
             # Fires only for whales tools (hooks.json's matcher): this project's memory is now sent.
             mark_whales_project(event)
+            note_autopilot_call(event)
         out = (session_id_injection(event, prefix) if args.source == "claude_code_hook"
                else cursor_session_id_injection(event, prefix))
         if out:
@@ -2605,7 +2735,7 @@ def main() -> int:
     # The hook server's calls run beside the existing ones (product question, product context), so their waits
     # overlap rather than add up.
     turn_live = (args.source == "claude_code_hook" and bool(session_id and token) and state != "rejected"
-                 and turn_on())
+                 and turn_on() and not autopilot_running(session_id))
     folder = session_folder(event)
     # Claude opened a screenshot (Read of an image): during a critique, whales measures it and says where the
     # result will be. Waited on (a few seconds), never captured.
@@ -2669,6 +2799,7 @@ def main() -> int:
             root = _git_out(folder, "rev-parse", "--show-toplevel") if folder else ""
             write_turn_files(root or folder, answer.get("files"))
             merge_turn_answer(notice, answer, args.event)
+        notice = merge_autopilot(notice, autopilot_output(args.event, event, session_id, prefix))
         if notice:
             print(json.dumps(notice))
     if pool is not None:

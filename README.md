@@ -24,9 +24,9 @@ isn't a TTY, which is the case inside `curl | bash`.
 | | |
 |---|---|
 | **MCP server** | The whales gateway over streamable HTTP, authenticated with `${user_config.whales_token}` |
-| **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system), `universal-critique` (whales critiques a screen; its `critique_source.py` uploads the file itself) |
+| **Skills** | `design-profile` (apply the designer's conventions to UI work), `design-system` (extract/register/maintain a design system), `universal-critique` (whales critiques a screen; its `critique_source.py` uploads the file itself), `whales-autopilot` (internal: whales directs a redesign the agent builds in the repo; `autopilot_shoot.py` shoots, measures and uploads each version) |
 | **Agent** | `design-review` — conformance-checks a diff in its own context |
-| **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd; PreToolUse on whales tools adds `client_session_id` |
+| **Hooks** | Capture on SessionStart, UserPromptSubmit, PostToolUse(Write\|Edit), PreCompact, Stop, SessionEnd; PreToolUse on whales tools adds `client_session_id`; in a session that has called `whales_autopilot`, Stop sends the turn back while a move waits for the host and UserPromptSubmit passes on the run's questions |
 **Permissions are not in the plugin.** Claude Code ignores `permissions` in a
 plugin's `settings.json`; only `agent` and `subagentStatusLine` take effect
 there (checked 2026-09-24 on 2.1.282: a plugin-allowed command still needed

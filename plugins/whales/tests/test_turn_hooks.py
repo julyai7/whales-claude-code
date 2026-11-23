@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -193,6 +194,35 @@ def test_stop_honours_a_block(tmp_path):
     assert out["decision"] == "block" and "contrast" in out["reason"]
     stop = [b for p, b in server.seen if p == "/hooks/turn/stop"]
     assert stop[0]["payload"]["reply"] == "Done."
+
+
+def test_an_autopilot_run_keeps_the_hook_server_out_of_the_session(tmp_path):
+    # Autopilot directs the agent itself: while its run is going (the marker its PreToolUse writes), no hook event
+    # reaches the hook server, so nothing asks to proceed, briefs or grades the turn.
+    server = _Server({"prompt": {"context": "whales · build new"}, "stop": {"decision": {"block": True, "reason": "x"}}})
+    home = _home(tmp_path, server.url)
+    (home / ".whales" / "autopilot").mkdir()
+    (home / ".whales" / "autopilot" / "s4.json").write_text('{"run_id": "r1", "blocks": 0}')
+    try:
+        p = _run("UserPromptSubmit", {"session_id": "s4", "prompt": "the cards feel cramped"}, home)
+        s = _run("Stop", {"session_id": "s4", "last_assistant_message": "Built it."}, home)
+        other = _run("UserPromptSubmit", {"session_id": "s5", "prompt": "the cards feel cramped"}, home)
+    finally:
+        server.close()
+    assert "build new" not in p.stdout and '"block"' not in s.stdout
+    sessions = [b["client_session_id"] for path, b in server.seen if path.startswith("/hooks/turn/")]
+    assert "cc:s4" not in sessions and "cc:s5" in sessions  # another session is unaffected
+    assert "build new" in other.stdout
+
+
+def test_a_stale_autopilot_marker_lets_the_hook_server_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(wh, "AUTOPILOT_DIR", str(tmp_path))
+    marker = tmp_path / "s6.json"
+    marker.write_text("{}")
+    assert wh.autopilot_running("s6") and not wh.autopilot_running("nope") and not wh.autopilot_running("")
+    old = time.time() - wh._AUTOPILOT_MARKER_MAX_AGE_S - 60
+    os.utime(marker, (old, old))
+    assert not wh.autopilot_running("s6")
 
 
 # --- what a Stop sends the grader --------------------------------------------------------------------------------
